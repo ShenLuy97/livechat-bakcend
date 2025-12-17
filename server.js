@@ -8,7 +8,7 @@ const app = express();
 // Manual CORS headers for extra safety
 app.use((req, res, next) => {
     const allowedOrigins = [
-        'https://livechat-backend-rj7y.onrender.com',
+        'https://livechat-bakcend.onrender.com',
         'https://n8n.ihubtechnologies.com.au',
         'https://ihubs-chat.infinityfreeapp.com'
     ];
@@ -3217,7 +3217,7 @@ app.get("/debug/chat-state", (req, res) => {
         },
         instructions: {
             step1: 'Check browser console for debug logs',
-            step2: 'Test directly: curl -X POST https://livechat-backend-rj7y.onrender.com/n8n/get-prompt -H "Content-Type: application/json" -d \'{"agent_type": "sales"}\'',
+            step2: 'Test directly: curl -X POST https://livechat-bakcend.onrender.com/n8n/get-prompt -H "Content-Type: application/json" -d \'{"agent_type": "sales"}\'',
             step3: 'Check n8n workflow execution logs'
         }
     });
@@ -3306,6 +3306,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
