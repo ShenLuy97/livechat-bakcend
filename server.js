@@ -412,10 +412,10 @@ app.post("/ai/chat", async (req, res) => {
         // If still no category found, set defaults based on agent type
         if (!categoryId) {
             const defaultCategoryMap = {
-                support: 1, // general_support
-                sales: 5,   // pricing_info
-                automation: 6, // account_management
-                general: 7  // general_faq
+                support: 7, // general_support
+                sales: 8,   // pricing_info
+                automation: 14, // automation
+                general: 18  // general_faq
             };
             categoryId = defaultCategoryMap[finalAgentType] || 7;
             console.log(`⚠️ No category found, using default: ID ${categoryId}`);
@@ -424,7 +424,7 @@ app.post("/ai/chat", async (req, res) => {
         console.log(`✅ Final - Category ID: ${categoryId}, System Type: ${systemTypeName || 'None'}, Agent: ${finalAgentType}`);
 
         // ===============================
-        // 🔍 SEARCH RELEVANT FAQS FROM DATABASE
+        // 🔍 IMPROVED FAQ SEARCH FROM DATABASE
         // ===============================
         let relevantFaqs = [];
         let faqIdsUsed = [];
@@ -433,58 +433,13 @@ app.post("/ai/chat", async (req, res) => {
         // Only search FAQ table for relevant questions
         if (message.trim().length > 2) {
             try {
-                // First, try with category filter
-                const searchQuery = `
-                    SELECT 
-                        id, 
-                        question, 
-                        answer, 
-                        answer_short,
-                        category_id,
-                        keywords,
-                        confidence_score,
-                        priority,
-                        usage_count,
-                        status
-                    FROM chatbot_faq 
-                    WHERE status = 'active' 
-                    AND (? IS NULL OR category_id = ?)
-                    AND (
-                        question LIKE ? 
-                        OR answer LIKE ?
-                        OR keywords LIKE ?
-                        OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
-                    )
-                    ORDER BY 
-                        priority DESC,
-                        confidence_score DESC,
-                        usage_count DESC
-                    LIMIT 5
-                `;
-
-                // Build search term
-                const searchTerm = `%${message}%`;
-                const booleanSearch = message.split(' ').map(word => `+${word}*`).join(' ');
-
-                const [faqRows] = await db.promise().query(searchQuery, [
-                    categoryId, categoryId,
-                    searchTerm, searchTerm, searchTerm,
-                    booleanSearch
-                ]);
-
-                relevantFaqs = faqRows;
-                faqIdsUsed = faqRows.map(faq => faq.id);
-
-                // Calculate confidence based on FAQ matches
-                if (faqRows.length > 0) {
-                    const avgConfidence = faqRows.reduce((sum, faq) => 
-                        sum + parseFloat(faq.confidence_score || 1.0), 0) / faqRows.length;
-                    confidence = Math.min(0.95, avgConfidence * 0.9);
-                    
-                    console.log(`🔍 Found ${faqRows.length} relevant FAQs:`, faqRows.map(f => ({id: f.id, question: f.question.substring(0, 50)})));
-                } else {
-                    // No FAQ match, fallback search without category filter
-                    const fallbackQuery = `
+                // First, extract key terms from message
+                const searchTerms = extractSearchTerms(message);
+                console.log(`🔍 Extracted search terms:`, searchTerms);
+                
+                if (searchTerms.length > 0) {
+                    // First, try with category filter and keyword matching
+                    const searchQuery = `
                         SELECT 
                             id, 
                             question, 
@@ -498,43 +453,163 @@ app.post("/ai/chat", async (req, res) => {
                             status
                         FROM chatbot_faq 
                         WHERE status = 'active' 
+                        AND category_id = ?
                         AND (
-                            question LIKE ? 
-                            OR answer LIKE ?
-                            OR keywords LIKE ?
+                            ${searchTerms.map(() => `question LIKE ?`).join(' OR ')}
+                            OR ${searchTerms.map(() => `keywords LIKE ?`).join(' OR ')}
+                            OR ${searchTerms.map(() => `answer LIKE ?`).join(' OR ')}
                             OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
                         )
                         ORDER BY 
                             priority DESC,
+                            CASE 
+                                WHEN question LIKE ? THEN 10
+                                WHEN keywords LIKE ? THEN 9
+                                WHEN answer LIKE ? THEN 8
+                                ELSE 1
+                            END DESC,
                             confidence_score DESC,
                             usage_count DESC
-                        LIMIT 3
+                        LIMIT 5
                     `;
 
-                    const [fallbackRows] = await db.promise().query(fallbackQuery, [
-                        searchTerm, searchTerm, searchTerm,
-                        booleanSearch
-                    ]);
+                    // Prepare search parameters
+                    const searchParams = [categoryId];
+                    
+                    // Add LIKE parameters for each search term
+                    searchTerms.forEach(term => {
+                        searchParams.push(`%${term}%`);  // question LIKE
+                    });
+                    searchTerms.forEach(term => {
+                        searchParams.push(`%${term}%`);  // keywords LIKE
+                    });
+                    searchTerms.forEach(term => {
+                        searchParams.push(`%${term}%`);  // answer LIKE
+                    });
+                    
+                    // Add full message for boolean search
+                    const booleanSearch = searchTerms.map(word => `+${word}*`).join(' ');
+                    searchParams.push(booleanSearch);
+                    
+                    // Add exact match parameters for scoring
+                    searchParams.push(`%${message}%`);    // exact match in question
+                    searchParams.push(`%${message}%`);    // exact match in keywords  
+                    searchParams.push(`%${message}%`);    // exact match in answer
 
-                    if (fallbackRows.length > 0) {
-                        relevantFaqs = fallbackRows;
-                        faqIdsUsed = fallbackRows.map(faq => faq.id);
+                    console.log(`🔍 FAQ Search SQL with params:`, {
+                        query: searchQuery.substring(0, 200) + '...',
+                        params: searchParams
+                    });
+
+                    const [faqRows] = await db.promise().query(searchQuery, searchParams);
+
+                    relevantFaqs = faqRows;
+                    faqIdsUsed = faqRows.map(faq => faq.id);
+
+                    // Calculate confidence based on FAQ matches
+                    if (faqRows.length > 0) {
+                        const avgConfidence = faqRows.reduce((sum, faq) => 
+                            sum + parseFloat(faq.confidence_score || 1.0), 0) / faqRows.length;
+                        confidence = Math.min(0.95, avgConfidence * 0.9);
                         
-                        const avgConfidence = fallbackRows.reduce((sum, faq) => 
-                            sum + parseFloat(faq.confidence_score || 1.0), 0) / fallbackRows.length;
-                        confidence = Math.min(0.85, avgConfidence * 0.8); // Lower confidence for fallback
-                        
-                        console.log(`🔍 Found ${fallbackRows.length} fallback FAQs (no category match)`);
+                        console.log(`🔍 Found ${faqRows.length} relevant FAQs:`, faqRows.map(f => ({id: f.id, question: f.question.substring(0, 50)})));
                     } else {
-                        // No FAQ match, use agent type confidence
-                        const confidenceMap = {
-                            sales: 0.85,
-                            support: 0.75,
-                            automation: 0.80,
-                            general: 0.65
-                        };
-                        confidence = (confidenceMap[finalAgentType] || 0.6) * 0.8;
-                        console.log(`⚠️ No FAQs found, using default confidence: ${confidence}`);
+                        // No FAQ match, fallback search without category filter but with terms
+                        const fallbackQuery = `
+                            SELECT 
+                                id, 
+                                question, 
+                                answer, 
+                                answer_short,
+                                category_id,
+                                keywords,
+                                confidence_score,
+                                priority,
+                                usage_count,
+                                status
+                            FROM chatbot_faq 
+                            WHERE status = 'active' 
+                            AND (
+                                ${searchTerms.map(() => `question LIKE ?`).join(' OR ')}
+                                OR ${searchTerms.map(() => `keywords LIKE ?`).join(' OR ')}
+                                OR ${searchTerms.map(() => `answer LIKE ?`).join(' OR ')}
+                                OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
+                            )
+                            ORDER BY 
+                                priority DESC,
+                                confidence_score DESC,
+                                usage_count DESC
+                            LIMIT 3
+                        `;
+
+                        const fallbackParams = [];
+                        searchTerms.forEach(term => {
+                            fallbackParams.push(`%${term}%`);  // question LIKE
+                        });
+                        searchTerms.forEach(term => {
+                            fallbackParams.push(`%${term}%`);  // keywords LIKE
+                        });
+                        searchTerms.forEach(term => {
+                            fallbackParams.push(`%${term}%`);  // answer LIKE
+                        });
+                        fallbackParams.push(booleanSearch);
+
+                        const [fallbackRows] = await db.promise().query(fallbackQuery, fallbackParams);
+
+                        if (fallbackRows.length > 0) {
+                            relevantFaqs = fallbackRows;
+                            faqIdsUsed = fallbackRows.map(faq => faq.id);
+                            
+                            const avgConfidence = fallbackRows.reduce((sum, faq) => 
+                                sum + parseFloat(faq.confidence_score || 1.0), 0) / fallbackRows.length;
+                            confidence = Math.min(0.85, avgConfidence * 0.8); // Lower confidence for fallback
+                            
+                            console.log(`🔍 Found ${fallbackRows.length} fallback FAQs (no category match)`);
+                        } else {
+                            // Ultimate fallback: search for any Xero-related FAQ
+                            const xeroFallbackQuery = `
+                                SELECT 
+                                    id, 
+                                    question, 
+                                    answer, 
+                                    answer_short,
+                                    category_id,
+                                    keywords,
+                                    confidence_score,
+                                    priority,
+                                    usage_count,
+                                    status
+                                FROM chatbot_faq 
+                                WHERE status = 'active' 
+                                AND (
+                                    question LIKE '%xero%'
+                                    OR keywords LIKE '%xero%'
+                                    OR answer LIKE '%xero%'
+                                )
+                                ORDER BY priority DESC, usage_count DESC
+                                LIMIT 2
+                            `;
+
+                            const [xeroRows] = await db.promise().query(xeroFallbackQuery);
+                            
+                            if (xeroRows.length > 0) {
+                                relevantFaqs = xeroRows;
+                                faqIdsUsed = xeroRows.map(faq => faq.id);
+                                confidence = 0.75; // Medium confidence for keyword-only match
+                                
+                                console.log(`🔍 Found ${xeroRows.length} Xero-related FAQs`);
+                            } else {
+                                // No FAQ match, use agent type confidence
+                                const confidenceMap = {
+                                    sales: 0.85,
+                                    support: 0.75,
+                                    automation: 0.80,
+                                    general: 0.65
+                                };
+                                confidence = (confidenceMap[finalAgentType] || 0.6) * 0.8;
+                                console.log(`⚠️ No FAQs found, using default confidence: ${confidence}`);
+                            }
+                        }
                     }
                 }
             } catch (searchErr) {
@@ -924,6 +999,36 @@ app.post("/ai/chat", async (req, res) => {
         return res.status(200).json(emergencyResponse); // Return 200 with fallback, not 500
     }
 });
+
+// Helper function for extracting search terms
+function extractSearchTerms(message) {
+    const stopWords = ['i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 
+                      'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 
+                      'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 
+                      'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 
+                      'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 
+                      'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 
+                      'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 
+                      'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 
+                      'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 
+                      'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 
+                      'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 
+                      'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'please', 'help'];
+    
+    return message.toLowerCase()
+        .split(/[\s,.?!]+/)
+        .map(term => term.trim())
+        .filter(term => term.length > 2 && !stopWords.includes(term))
+        .map(term => {
+            // Basic stemming
+            return term
+                .replace(/ed$/, '')    // remove 'ed' suffix
+                .replace(/ing$/, '')   // remove 'ing' suffix
+                .replace(/s$/, '');    // remove 's' suffix
+        })
+        .filter(term => term.length > 2)
+        .slice(0, 5); // Limit to 5 most important terms
+}
 
 app.post("/test-ai-fallback", async (req, res) => {
     const testPayload = {
@@ -3306,6 +3411,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
