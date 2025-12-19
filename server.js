@@ -10,6 +10,7 @@ app.use((req, res, next) => {
     const allowedOrigins = [
         'https://livechat-bakcend.onrender.com',
         'https://n8n.ihubtechnologies.com.au',
+        'https://demo-crm.ihubtechnologies.com.au/',
         'https://ihubs-chat.infinityfreeapp.com'
     ];
     
@@ -3411,6 +3412,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
