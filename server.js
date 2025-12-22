@@ -1196,13 +1196,10 @@ app.post("/n8n/get-prompt", async (req, res) => {
       // Now use `body` instead of `req.body`
       const rawAgentType = body.agent_type;
       const context = body.context || {};
-      const message = body.message || "";
       
       console.log("🔍 ========== DEBUG START ==========");
       console.log("🔍 Raw agent_type from request:", rawAgentType);
       console.log("🔍 Type of agent_type:", typeof rawAgentType);
-      console.log("🔍 Context:", JSON.stringify(context, null, 2));
-      console.log("🔍 Message:", message);
       
       // 🔒 FIX: Proper agent_type determination
       let agentTypeForQuery = "general"; // Default fallback
@@ -1231,7 +1228,8 @@ app.post("/n8n/get-prompt", async (req, res) => {
       console.log("🔍 Final agent_type for query:", agentTypeForQuery);
       console.log("🔍 ========== DEBUG END ==========");
 
-      const query = `
+      // QUERY 1: Cari prompt spesifik untuk agent_type yang diminta
+      const specificQuery = `
         SELECT * FROM chatbot_prompts
         WHERE agent_type = ?
         AND is_active = 1
@@ -1241,40 +1239,111 @@ app.post("/n8n/get-prompt", async (req, res) => {
       `;
 
       console.log(`📡 Query Database with: "${agentTypeForQuery}"`);
-      console.log("🔍 SQL Query:", query);
+      console.log("🔍 SQL Query:", specificQuery);
 
-      db.query(query, [agentTypeForQuery], (error, results) => {
+      db.query(specificQuery, [agentTypeForQuery], (error, specificResults) => {
         if (error) {
           console.error("❌ Database error:", error);
-          return res.json({
-            success: false,
-            error: "Database query failed",
-            timestamp: new Date().toISOString()
-          });
+          return sendHardcodedFallbackResponse(rawAgentType, context, res, "database_error");
         }
 
-        // 🔍 DEBUG: Query results
-        console.log(`🔍 Database results: ${results.length} rows`);
-        if (results.length > 0) {
-          console.log(`🔍 Found record with agent_type: "${results[0].agent_type}"`);
-          console.log(`🔍 Record identity: "${results[0].identity}"`);
-          console.log(`🔍 Record version: "${results[0].version}"`);
-          console.log(`🔍 Record status: "${results[0].status}"`);
-          console.log(`🔍 Record is_active: ${results[0].is_active}`);
-        } else {
-          console.log(`❌ No active prompt found for "${agentTypeForQuery}"`);
+        console.log(`🔍 Database results for "${agentTypeForQuery}": ${specificResults.length} rows`);
+        
+        // KASUS 1: Prompt spesifik DITEMUKAN
+        if (specificResults.length > 0) {
+          const prompt = specificResults[0];
+          console.log(`✅ Found specific prompt for "${agentTypeForQuery}": ${prompt.identity}`);
           
-          // Try fallback to general if specific type not found
-          if (agentTypeForQuery !== "general") {
-            console.log(`🔄 Trying fallback to general...`);
-            db.query(query, ["general"], (fallbackError, fallbackResults) => {
-              handleFallbackQuery(fallbackError, fallbackResults, rawAgentType, agentTypeForQuery, context, res);
-            });
-            return;
-          }
+          const systemPrompt = buildSystemPromptForN8N(prompt, context, agentTypeForQuery);
+          
+          return res.json({
+            success: true,
+            prompt: {
+              system_prompt: systemPrompt,
+              identity: prompt.identity,
+              agent_type: agentTypeForQuery, // GUNAKAN AGENT TYPE YANG SESUAI
+              language: prompt.language || "australian_english",
+              tone: prompt.tone || "professional",
+              version: prompt.version || "v1.0",
+              context_knowledge: prompt.context_knowledge || "",
+              role_description: prompt.role_description || "",
+              status: prompt.status || "active"
+            },
+            is_fallback: false,
+            timestamp: new Date().toISOString(),
+            debug: {
+              requested_agent_type: rawAgentType,
+              query_agent_type: agentTypeForQuery,
+              db_agent_type: prompt.agent_type,
+              response_agent_type: agentTypeForQuery,
+              note: "Using specific prompt found in database"
+            }
+          });
         }
         
-        handleQueryResults(error, results, rawAgentType, agentTypeForQuery, context, res);
+        // KASUS 2: Prompt spesifik TIDAK ditemukan
+        console.log(`⚠️ No specific prompt found for "${agentTypeForQuery}", trying general...`);
+        
+        // Cari prompt general (hanya jika bukan sudah general)
+        if (agentTypeForQuery === "general") {
+          // Sudah cari general tapi tidak ketemu
+          console.log("❌ No general prompt found either");
+          return sendHardcodedFallbackResponse(rawAgentType, context, res, "no_prompts_found");
+        }
+        
+        // Query untuk general
+        const generalQuery = `
+          SELECT * FROM chatbot_prompts
+          WHERE agent_type = 'general'
+          AND is_active = 1
+          AND status = 'active'
+          ORDER BY version DESC
+          LIMIT 1
+        `;
+        
+        db.query(generalQuery, (generalError, generalResults) => {
+          if (generalError) {
+            console.error("❌ General query error:", generalError);
+            return sendHardcodedFallbackResponse(rawAgentType, context, res, "general_query_error");
+          }
+          
+          // KASUS 2A: Prompt general DITEMUKAN
+          if (generalResults.length > 0) {
+            const generalPrompt = generalResults[0];
+            console.log(`🔄 Using general prompt as fallback: ${generalPrompt.identity}`);
+            
+            // PENTING: Gunakan "general" sebagai agent_type karena memang kita pakai prompt general
+            const fallbackAgentType = "general";
+            const systemPrompt = buildSystemPromptForN8N(generalPrompt, context, fallbackAgentType);
+            
+            return res.json({
+              success: true,
+              prompt: {
+                system_prompt: systemPrompt,
+                identity: generalPrompt.identity,
+                agent_type: fallbackAgentType, // ⚠️ GUNAKAN "general" bukan rawAgentType!
+                language: generalPrompt.language || "australian_english",
+                tone: generalPrompt.tone || "professional",
+                version: generalPrompt.version || "v1.0",
+                context_knowledge: generalPrompt.context_knowledge || "",
+                role_description: generalPrompt.role_description || ""
+              },
+              is_fallback: true,
+              timestamp: new Date().toISOString(),
+              debug: {
+                requested_agent_type: rawAgentType,
+                original_query_agent_type: agentTypeForQuery,
+                fallback_agent_type: fallbackAgentType,
+                response_agent_type: fallbackAgentType, // ⚠️ response juga general
+                note: `No specific prompt found for "${agentTypeForQuery}", using general prompt`
+              }
+            });
+          }
+          
+          // KASUS 2B: Tidak ada prompt sama sekali
+          console.log("❌ No general prompt found either");
+          return sendHardcodedFallbackResponse(rawAgentType, context, res, "no_prompts_in_database");
+        });
       });
 
     } catch (error) {
@@ -1287,6 +1356,83 @@ app.post("/n8n/get-prompt", async (req, res) => {
     }
   });
 });
+
+// 🔧 Helper function untuk hardcoded fallback response
+function sendHardcodedFallbackResponse(requestedAgentType, context, res, reason) {
+  console.log(`🔄 Sending hardcoded fallback response due to: ${reason}`);
+  
+  // SELALU gunakan "general" untuk fallback hardcoded
+  const fallbackAgentType = "general";
+  
+  const fallbackPrompt = {
+    identity: `${fallbackAgentType.charAt(0).toUpperCase() + fallbackAgentType.slice(1)} Assistant`,
+    context_knowledge: "General information about iHub products and services.",
+    role_description: `Assist with ${fallbackAgentType} related inquiries.`,
+    language: "australian_english",
+    tone: "professional"
+  };
+  
+  const systemPrompt = buildSystemPromptForN8N(fallbackPrompt, context, fallbackAgentType);
+
+  res.json({
+    success: true,
+    prompt: {
+      system_prompt: systemPrompt,
+      identity: fallbackPrompt.identity,
+      agent_type: fallbackAgentType, // ⚠️ GUNAKAN "general"
+      language: fallbackPrompt.language,
+      tone: fallbackPrompt.tone,
+      version: "hardcoded_fallback",
+      context_knowledge: fallbackPrompt.context_knowledge,
+      role_description: fallbackPrompt.role_description
+    },
+    is_fallback: true,
+    timestamp: new Date().toISOString(),
+    debug: {
+      requested_agent_type: requestedAgentType,
+      response_agent_type: fallbackAgentType,
+      fallback_reason: reason
+    }
+  });
+}
+
+function sendHardcodedFallbackResponse(requestedAgentType, context, res) {
+  console.log(`🔄 Sending hardcoded fallback response`);
+  
+  // SELALU gunakan "general" untuk fallback hardcoded
+  const fallbackAgentType = "general";
+  
+  const fallbackPrompt = {
+    identity: `${fallbackAgentType.charAt(0).toUpperCase() + fallbackAgentType.slice(1)} Assistant`,
+    context_knowledge: "General information about iHub products and services.",
+    role_description: `Assist with ${fallbackAgentType} related inquiries.`,
+    language: "australian_english",
+    tone: "professional"
+  };
+  
+  const systemPrompt = buildSystemPromptForN8N(fallbackPrompt, context, fallbackAgentType);
+
+  res.json({
+    success: true,
+    prompt: {
+      system_prompt: systemPrompt,
+      identity: fallbackPrompt.identity,
+      agent_type: fallbackAgentType, // ⚠️ GUNAKAN "general"
+      language: fallbackPrompt.language,
+      tone: fallbackPrompt.tone,
+      version: "hardcoded_fallback",
+      context_knowledge: fallbackPrompt.context_knowledge,
+      role_description: fallbackPrompt.role_description
+    },
+    is_fallback: true,
+    timestamp: new Date().toISOString(),
+    debug: {
+      requested_agent_type: requestedAgentType,
+      response_agent_type: fallbackAgentType,
+      fallback_reason: "no_prompts_in_database"
+    }
+  });
+}
 
 // 🔧 Helper function to handle query results
 function handleQueryResults(error, results, rawAgentType, queryAgentType, context, res) {
@@ -1553,7 +1699,7 @@ app.get("/ai/dashboard", (req, res) => {
 // FUNGSI YANG BENAR (tunggal):
 function buildSystemPromptForN8N(promptData, context, agentType) {
   // Ensure agentType is always set
-  const finalAgentType = agentType || promptData.agent_type || "general";
+  const finalAgentType = agentType;
   
   console.log(`🔍 Building prompt for agent_type: "${finalAgentType}"`);
   console.log(`🔍 promptData.agent_type: "${promptData.agent_type}"`);
@@ -1765,38 +1911,45 @@ async function findSimilarConversations(currentMessage, agent_type, limit = 5) {
 }
 
     // Ambil prompt dengan version terbaru
-    async function getAgentPrompt(agent_type) {
-        return new Promise((resolve, reject) => {
-            console.log(`🔍 getAgentPrompt called for: "${agent_type}"`);
-            
-            const query = `
-                SELECT * FROM chatbot_prompts 
-                WHERE agent_type = ? 
-                AND is_active = 1 
-                AND status = 'active'
-                ORDER BY version DESC 
-                LIMIT 1
-            `;
-            
-            db.query(query, [agent_type], (error, results) => {
-                if (error) {
-                    console.error("❌ Get prompt error:", error);
-                    resolve(null);
-                } else if (results.length === 0) {
-                    console.log(`⚠️ No active prompt found for "${agent_type}"`);
-                    
-                    // DON'T fallback to general automatically
-                    // Let the caller handle fallback
-                    resolve(null);
+async function getAgentPrompt(agent_type, forceGeneralFallback = false) {
+    return new Promise((resolve, reject) => {
+        console.log(`🔍 getAgentPrompt called for: "${agent_type}"`);
+        
+        // Cari spesifik dulu
+        const query = `
+            SELECT * FROM chatbot_prompts 
+            WHERE agent_type = ? 
+            AND is_active = 1 
+            AND status = 'active'
+            ORDER BY version DESC 
+            LIMIT 1
+        `;
+        
+        db.query(query, [agent_type], (error, results) => {
+            if (error) {
+                console.error("❌ Get prompt error:", error);
+                resolve(null);
+            } else if (results.length === 0) {
+                console.log(`⚠️ No active prompt found for "${agent_type}"`);
+                
+                // Fallback ke general JIKA DIIZINKAN
+                if (forceGeneralFallback) {
+                    console.log(`🔄 Trying fallback to general...`);
+                    // Rekursi dengan parameter general
+                    getAgentPrompt("general", false).then(generalPrompt => {
+                        resolve(generalPrompt);
+                    });
                 } else {
-                    const prompt = results[0];
-                    console.log(`✅ Prompt found for ${agent_type}: ${prompt.identity}`);
-                    console.log(`   Version: ${prompt.version}, Status: ${prompt.status}`);
-                    resolve(prompt);
+                    resolve(null);
                 }
-            });
+            } else {
+                const prompt = results[0];
+                console.log(`✅ Prompt found for ${agent_type}: ${prompt.identity}`);
+                resolve(prompt);
+            }
         });
-    }
+    });
+}
 
 // Bangun enhanced prompt dengan learning
 
@@ -3359,6 +3512,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
