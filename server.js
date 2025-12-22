@@ -70,22 +70,6 @@ const db = mysql.createPool({
 });
 
 // -----------------------------------------------------
-// OPENAI CLIENT
-// -----------------------------------------------------
-
-// const client = {
-//     chat: {
-//         completions: {
-//             create: async () => {
-//                 throw new Error("OpenAI disabled - using fallback");
-//             }
-//         }
-//     }
-// };
-
-// console.log("⚠️ OpenAI is disabled - using simple AI responses");
-
-// -----------------------------------------------------
 // LIVE CHAT IN-MEMORY STORE
 // -----------------------------------------------------
 const sessions = {};
@@ -241,9 +225,6 @@ setInterval(() => {
 // -----------------------------------------------------
 // ENHANCED AI CHAT ENDPOINT (WITH LEARNING FROM PAST CONVERSATIONS)
 // -----------------------------------------------------
-// -----------------------------------------------------
-// ENHANCED AI CHAT ENDPOINT (WITH FALLBACK HANDLING)
-// -----------------------------------------------------
 app.post("/ai/chat", async (req, res) => {
     console.log("🎯 AI ENDPOINT Called");
     console.log("📥 FULL REQUEST BODY:", JSON.stringify(req.body, null, 2));
@@ -261,23 +242,14 @@ app.post("/ai/chat", async (req, res) => {
         } = req.body;
 
         // ===============================
-        // 🔒 AGENT TYPE — SINGLE SOURCE OF TRUTH
+        // AGENT TYPE VALIDATION
         // ===============================
-        const VALID_AGENT_TYPES = ["general", "sales", "automation", "support"];
-        
-        // ONLY read from req.body.agent_type
-        let finalAgentType = "general";
-        
-        if (
-            typeof agent_type === "string" &&
-            VALID_AGENT_TYPES.includes(agent_type)
-        ) {
-            finalAgentType = agent_type;
-        } else {
-            console.warn("⚠️ Invalid or missing agent_type, defaulting to general");
+        let finalAgentType = agent_type || context?.agent_type || "general";
+        const validAgentTypes = ["general", "sales", "automation", "support"];
+        if (!validAgentTypes.includes(finalAgentType)) {
+            console.warn("⚠️ Invalid agent_type, defaulting to general");
+            finalAgentType = "general";
         }
-        
-        console.log("🔒 LOCKED agent_type:", finalAgentType);
 
         // ===============================
         // DYNAMIC SYSTEM TYPE DETECTION
@@ -413,10 +385,10 @@ app.post("/ai/chat", async (req, res) => {
         // If still no category found, set defaults based on agent type
         if (!categoryId) {
             const defaultCategoryMap = {
-                support: 7, // general_support
-                sales: 8,   // pricing_info
-                automation: 14, // automation
-                general: 18  // general_faq
+                support: 1, // general_support
+                sales: 5,   // pricing_info
+                automation: 6, // account_management
+                general: 7  // general_faq
             };
             categoryId = defaultCategoryMap[finalAgentType] || 7;
             console.log(`⚠️ No category found, using default: ID ${categoryId}`);
@@ -425,7 +397,7 @@ app.post("/ai/chat", async (req, res) => {
         console.log(`✅ Final - Category ID: ${categoryId}, System Type: ${systemTypeName || 'None'}, Agent: ${finalAgentType}`);
 
         // ===============================
-        // 🔍 IMPROVED FAQ SEARCH FROM DATABASE
+        // 🔍 SEARCH RELEVANT FAQS FROM DATABASE
         // ===============================
         let relevantFaqs = [];
         let faqIdsUsed = [];
@@ -434,13 +406,58 @@ app.post("/ai/chat", async (req, res) => {
         // Only search FAQ table for relevant questions
         if (message.trim().length > 2) {
             try {
-                // First, extract key terms from message
-                const searchTerms = extractSearchTerms(message);
-                console.log(`🔍 Extracted search terms:`, searchTerms);
-                
-                if (searchTerms.length > 0) {
-                    // First, try with category filter and keyword matching
-                    const searchQuery = `
+                // First, try with category filter
+                const searchQuery = `
+                    SELECT 
+                        id, 
+                        question, 
+                        answer, 
+                        answer_short,
+                        category_id,
+                        keywords,
+                        confidence_score,
+                        priority,
+                        usage_count,
+                        status
+                    FROM chatbot_faq 
+                    WHERE status = 'active' 
+                    AND (? IS NULL OR category_id = ?)
+                    AND (
+                        question LIKE ? 
+                        OR answer LIKE ?
+                        OR keywords LIKE ?
+                        OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
+                    )
+                    ORDER BY 
+                        priority DESC,
+                        confidence_score DESC,
+                        usage_count DESC
+                    LIMIT 5
+                `;
+
+                // Build search term
+                const searchTerm = `%${message}%`;
+                const booleanSearch = message.split(' ').map(word => `+${word}*`).join(' ');
+
+                const [faqRows] = await db.promise().query(searchQuery, [
+                    categoryId, categoryId,
+                    searchTerm, searchTerm, searchTerm,
+                    booleanSearch
+                ]);
+
+                relevantFaqs = faqRows;
+                faqIdsUsed = faqRows.map(faq => faq.id);
+
+                // Calculate confidence based on FAQ matches
+                if (faqRows.length > 0) {
+                    const avgConfidence = faqRows.reduce((sum, faq) => 
+                        sum + parseFloat(faq.confidence_score || 1.0), 0) / faqRows.length;
+                    confidence = Math.min(0.95, avgConfidence * 0.9);
+                    
+                    console.log(`🔍 Found ${faqRows.length} relevant FAQs:`, faqRows.map(f => ({id: f.id, question: f.question.substring(0, 50)})));
+                } else {
+                    // No FAQ match, fallback search without category filter
+                    const fallbackQuery = `
                         SELECT 
                             id, 
                             question, 
@@ -454,163 +471,43 @@ app.post("/ai/chat", async (req, res) => {
                             status
                         FROM chatbot_faq 
                         WHERE status = 'active' 
-                        AND category_id = ?
                         AND (
-                            ${searchTerms.map(() => `question LIKE ?`).join(' OR ')}
-                            OR ${searchTerms.map(() => `keywords LIKE ?`).join(' OR ')}
-                            OR ${searchTerms.map(() => `answer LIKE ?`).join(' OR ')}
+                            question LIKE ? 
+                            OR answer LIKE ?
+                            OR keywords LIKE ?
                             OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
                         )
                         ORDER BY 
                             priority DESC,
-                            CASE 
-                                WHEN question LIKE ? THEN 10
-                                WHEN keywords LIKE ? THEN 9
-                                WHEN answer LIKE ? THEN 8
-                                ELSE 1
-                            END DESC,
                             confidence_score DESC,
                             usage_count DESC
-                        LIMIT 5
+                        LIMIT 3
                     `;
 
-                    // Prepare search parameters
-                    const searchParams = [categoryId];
-                    
-                    // Add LIKE parameters for each search term
-                    searchTerms.forEach(term => {
-                        searchParams.push(`%${term}%`);  // question LIKE
-                    });
-                    searchTerms.forEach(term => {
-                        searchParams.push(`%${term}%`);  // keywords LIKE
-                    });
-                    searchTerms.forEach(term => {
-                        searchParams.push(`%${term}%`);  // answer LIKE
-                    });
-                    
-                    // Add full message for boolean search
-                    const booleanSearch = searchTerms.map(word => `+${word}*`).join(' ');
-                    searchParams.push(booleanSearch);
-                    
-                    // Add exact match parameters for scoring
-                    searchParams.push(`%${message}%`);    // exact match in question
-                    searchParams.push(`%${message}%`);    // exact match in keywords  
-                    searchParams.push(`%${message}%`);    // exact match in answer
+                    const [fallbackRows] = await db.promise().query(fallbackQuery, [
+                        searchTerm, searchTerm, searchTerm,
+                        booleanSearch
+                    ]);
 
-                    console.log(`🔍 FAQ Search SQL with params:`, {
-                        query: searchQuery.substring(0, 200) + '...',
-                        params: searchParams
-                    });
-
-                    const [faqRows] = await db.promise().query(searchQuery, searchParams);
-
-                    relevantFaqs = faqRows;
-                    faqIdsUsed = faqRows.map(faq => faq.id);
-
-                    // Calculate confidence based on FAQ matches
-                    if (faqRows.length > 0) {
-                        const avgConfidence = faqRows.reduce((sum, faq) => 
-                            sum + parseFloat(faq.confidence_score || 1.0), 0) / faqRows.length;
-                        confidence = Math.min(0.95, avgConfidence * 0.9);
+                    if (fallbackRows.length > 0) {
+                        relevantFaqs = fallbackRows;
+                        faqIdsUsed = fallbackRows.map(faq => faq.id);
                         
-                        console.log(`🔍 Found ${faqRows.length} relevant FAQs:`, faqRows.map(f => ({id: f.id, question: f.question.substring(0, 50)})));
+                        const avgConfidence = fallbackRows.reduce((sum, faq) => 
+                            sum + parseFloat(faq.confidence_score || 1.0), 0) / fallbackRows.length;
+                        confidence = Math.min(0.85, avgConfidence * 0.8); // Lower confidence for fallback
+                        
+                        console.log(`🔍 Found ${fallbackRows.length} fallback FAQs (no category match)`);
                     } else {
-                        // No FAQ match, fallback search without category filter but with terms
-                        const fallbackQuery = `
-                            SELECT 
-                                id, 
-                                question, 
-                                answer, 
-                                answer_short,
-                                category_id,
-                                keywords,
-                                confidence_score,
-                                priority,
-                                usage_count,
-                                status
-                            FROM chatbot_faq 
-                            WHERE status = 'active' 
-                            AND (
-                                ${searchTerms.map(() => `question LIKE ?`).join(' OR ')}
-                                OR ${searchTerms.map(() => `keywords LIKE ?`).join(' OR ')}
-                                OR ${searchTerms.map(() => `answer LIKE ?`).join(' OR ')}
-                                OR MATCH(question, answer) AGAINST (? IN BOOLEAN MODE)
-                            )
-                            ORDER BY 
-                                priority DESC,
-                                confidence_score DESC,
-                                usage_count DESC
-                            LIMIT 3
-                        `;
-
-                        const fallbackParams = [];
-                        searchTerms.forEach(term => {
-                            fallbackParams.push(`%${term}%`);  // question LIKE
-                        });
-                        searchTerms.forEach(term => {
-                            fallbackParams.push(`%${term}%`);  // keywords LIKE
-                        });
-                        searchTerms.forEach(term => {
-                            fallbackParams.push(`%${term}%`);  // answer LIKE
-                        });
-                        fallbackParams.push(booleanSearch);
-
-                        const [fallbackRows] = await db.promise().query(fallbackQuery, fallbackParams);
-
-                        if (fallbackRows.length > 0) {
-                            relevantFaqs = fallbackRows;
-                            faqIdsUsed = fallbackRows.map(faq => faq.id);
-                            
-                            const avgConfidence = fallbackRows.reduce((sum, faq) => 
-                                sum + parseFloat(faq.confidence_score || 1.0), 0) / fallbackRows.length;
-                            confidence = Math.min(0.85, avgConfidence * 0.8); // Lower confidence for fallback
-                            
-                            console.log(`🔍 Found ${fallbackRows.length} fallback FAQs (no category match)`);
-                        } else {
-                            // Ultimate fallback: search for any Xero-related FAQ
-                            const xeroFallbackQuery = `
-                                SELECT 
-                                    id, 
-                                    question, 
-                                    answer, 
-                                    answer_short,
-                                    category_id,
-                                    keywords,
-                                    confidence_score,
-                                    priority,
-                                    usage_count,
-                                    status
-                                FROM chatbot_faq 
-                                WHERE status = 'active' 
-                                AND (
-                                    question LIKE '%xero%'
-                                    OR keywords LIKE '%xero%'
-                                    OR answer LIKE '%xero%'
-                                )
-                                ORDER BY priority DESC, usage_count DESC
-                                LIMIT 2
-                            `;
-
-                            const [xeroRows] = await db.promise().query(xeroFallbackQuery);
-                            
-                            if (xeroRows.length > 0) {
-                                relevantFaqs = xeroRows;
-                                faqIdsUsed = xeroRows.map(faq => faq.id);
-                                confidence = 0.75; // Medium confidence for keyword-only match
-                                
-                                console.log(`🔍 Found ${xeroRows.length} Xero-related FAQs`);
-                            } else {
-                                // No FAQ match, use agent type confidence
-                                const confidenceMap = {
-                                    sales: 0.85,
-                                    support: 0.75,
-                                    automation: 0.80,
-                                    general: 0.65
-                                };
-                                confidence = (confidenceMap[finalAgentType] || 0.6) * 0.8;
-                                console.log(`⚠️ No FAQs found, using default confidence: ${confidence}`);
-                            }
-                        }
+                        // No FAQ match, use agent type confidence
+                        const confidenceMap = {
+                            sales: 0.85,
+                            support: 0.75,
+                            automation: 0.80,
+                            general: 0.65
+                        };
+                        confidence = (confidenceMap[finalAgentType] || 0.6) * 0.8;
+                        console.log(`⚠️ No FAQs found, using default confidence: ${confidence}`);
                     }
                 }
             } catch (searchErr) {
@@ -661,154 +558,23 @@ app.post("/ai/chat", async (req, res) => {
         }, null, 2));
 
         // ===============================
-        // 🔧 ROBUST N8N CALL WITH FALLBACK
+        // CALL N8N
         // ===============================
-        let n8nData = null;
-        let n8nError = null;
-        
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 10000);
-            
-            console.log(`🔗 Calling N8N: https://n8n.ihubtechnologies.com.au/webhook/ihubs_chat`);
-            
-            const n8nResponse = await fetch(
-                "https://n8n.ihubtechnologies.com.au/webhook/ihubs_chat",
-                {
-                    method: "POST",
-                    headers: { 
-                        "Content-Type": "application/json",
-                        "X-Source": "ihub-server-ai",
-                        "X-Debug": "true",
-                        "X-Agent-Type": finalAgentType
-                    },
-                    body: JSON.stringify(n8nPayload),
-                    signal: controller.signal
-                }
-            );
-            
-            clearTimeout(timeoutId);
-            
-            console.log(`📡 N8N Response Status: ${n8nResponse.status} ${n8nResponse.statusText}`);
-            
-            // Get raw response text
-            const responseText = await n8nResponse.text();
-            console.log(`📡 N8N Raw Response Length: ${responseText.length} chars`);
-            if (responseText.length > 0) {
-                console.log(`📡 N8N Raw Response Preview: ${responseText.substring(0, 500)}...`);
+        const n8nResponse = await fetch(
+            "https://n8n.ihubtechnologies.com.au/webhook/ihubs_chat",
+            {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(n8nPayload)
             }
-            
-            if (!n8nResponse.ok) {
-                n8nError = `N8N HTTP Error ${n8nResponse.status}: ${responseText.substring(0, 200)}`;
-                console.error(`❌ ${n8nError}`);
-            }
-            
-            // Try to parse JSON
-            if (responseText && responseText.trim().length > 0) {
-                try {
-                    n8nData = JSON.parse(responseText);
-                    console.log("✅ N8N JSON parsed successfully");
-                    
-                    // Ensure required fields exist
-                    if (!n8nData.reply && !n8nData.message) {
-                        console.warn("⚠️ N8N response missing 'reply' or 'message' field");
-                        n8nData.reply = "I understand your query. Let me provide you with the information you need.";
-                    }
-                } catch (parseError) {
-                    n8nError = `N8N returned invalid JSON: ${parseError.message}`;
-                    console.error(`❌ ${n8nError}`);
-                }
-            } else {
-                n8nError = "N8N returned empty response";
-                console.error(`❌ ${n8nError}`);
-            }
-            
-        } catch (fetchErr) {
-            n8nError = `N8N fetch failed: ${fetchErr.message}`;
-            console.error(`❌ ${n8nError}`);
+        );
+
+        if (!n8nResponse.ok) {
+            throw new Error(`N8N responded with ${n8nResponse.status}`);
         }
 
-        // ===============================
-        // FALLBACK RESPONSE IF N8N FAILS
-        // ===============================
-        if (n8nError || !n8nData) {
-            console.log(`🔄 Using fallback response due to N8N error: ${n8nError}`);
-            
-            const fallbackResponses = {
-                sales: {
-                    pricing: `Our ${systemTypeName || 'WasteVantage'} pricing plans:\n\n` +
-                            `💰 Start from: $299/month\n` +
-                            `• For small operators\n` +
-                            `• 30 days free trial\n` +                            
-                            `Would you like me to arrange a personalized demo or connect you with our sales team for more details?`,
-                    
-                    features: `The ${systemTypeName || 'WasteVantage'} platform includes:\n\n` +
-                             `✅ Real-time waste tracking\n` +
-                             `✅ Compliance reporting\n` +
-                             `✅ Automated billing\n` +
-                             `✅ Multi-site management\n` +
-                             `✅ Mobile app access\n` +
-                             `✅ Environmental reporting\n\n` +
-                             
-                             `Would you like more details about any specific feature?`,
-                    
-                    default: `I'd be happy to help with ${systemTypeName || 'WasteVantage'} sales information. ` +
-                            `Our team can provide you with detailed pricing, features, and a personalized demo. ` +
-                            `Would you like me to connect you with a sales representative?`
-                },
-                support: {
-                    default: `For ${systemTypeName || 'WasteVantage'} support, here are your options:\n\n` +
-                            `📞 **Phone**: 1300-123-456 (Mon-Fri 9am-5pm AEST)\n` +
-                            `📧 **Email**: support@ihub.com.au\n` +
-                            `🌐 **Help Center**: help.ihub.com.au\n` +
-                            `💬 **Live Chat**: Available on our website\n\n` +
-                            
-                            `What specific issue are you experiencing?`
-                },
-                general: {
-                    default: `I can help you with information about ${systemTypeName || 'iHub products'}. ` +
-                            `You asked about "${message}". ` +
-                            `What specifically would you like to know?`
-                },
-                automation: {
-                    default: `For ${systemTypeName || 'HiThereAI'} automation solutions:\n\n` +
-                            `🤖 **Workflow Automation**: Automate repetitive tasks\n` +
-                            `🔗 **API Integrations**: Connect with your existing systems\n` +
-                            `📊 **Data Processing**: Automated data extraction and processing\n` +
-                            `📈 **Reporting**: Automated report generation\n\n` +
-                            
-                            `What specific process would you like to automate?`
-                }
-            };
-            
-            const lowerMsg = message.toLowerCase();
-            let fallbackReply = fallbackResponses[finalAgentType]?.default || fallbackResponses.general.default;
-            
-            // Choose more specific response based on message
-            if (finalAgentType === 'sales') {
-                if (lowerMsg.includes('price') || lowerMsg.includes('cost') || lowerMsg.includes('plan') || lowerMsg.includes('month')) {
-                    fallbackReply = fallbackResponses.sales.pricing;
-                } else if (lowerMsg.includes('feature') || lowerMsg.includes('what can') || lowerMsg.includes('include')) {
-                    fallbackReply = fallbackResponses.sales.features;
-                }
-            }
-            
-            n8nData = {
-                success: true,
-                reply: fallbackReply,
-                agent_type: finalAgentType,
-                category_id: categoryId,
-                category_name: categoryName,
-                system_type_id: systemTypeId,
-                system_type_name: systemTypeName,
-                confidence: confidence * 0.9, // Slightly lower confidence for fallback
-                source: "fallback_response",
-                n8n_error: n8nError,
-                timestamp: new Date().toISOString()
-            };
-            
-            console.log(`✅ Using fallback response for ${finalAgentType}`);
-        }
+        const n8nData = await n8nResponse.json();
+        console.log("✅ N8N Response:", JSON.stringify(n8nData, null, 2));
 
         // ===============================
         // RESPONSE TIME & UPDATE FAQ USAGE
@@ -836,77 +602,76 @@ app.post("/ai/chat", async (req, res) => {
         }
 
         // ===============================
-        // PERSIST TO DATABASE (with error handling)
+        // PERSIST TO DATABASE
         // ===============================
-        try {
-            const insertSql = `
-                INSERT INTO chatbot_conversations
-                (
-                    session_id,
-                    system_type_id,
-                    customer_id,
-                    lead_id,
-                    user_email,
-                    user_name,
-                    user_phone,
-                    user_company,
-                    user_ip,
-                    agent_type,
-                    category_id,
-                    user_message,
-                    ai_response,
-                    faq_ids_used,
-                    confidence,
-                    resolved,
-                    user_satisfaction,
-                    escalated_to_human,
-                    escalation_reason,
-                    created_ticket_id,
-                    created_lead_id,
-                    created_inquiry_id,
-                    created_task_id,
-                    response_time_ms,
-                    tokens_used,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-            `;
-
-            const insertValues = [
-                conversation_id || `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                systemTypeId || context?.system_type_id || null,
-                null, // customer_id
-                null, // lead_id
-                user_email || null,
+        const insertSql = `
+            INSERT INTO chatbot_conversations
+            (
+                session_id,
+                system_type_id,
+                customer_id,
+                lead_id,
+                user_email,
                 user_name,
-                null, // user_phone
-                null, // user_company
-                req.ip || null,
-                finalAgentType,
-                categoryId,
-                message,
-                n8nData.reply || n8nData.message || "No response",
-                faqIdsUsed.length > 0 ? JSON.stringify(faqIdsUsed) : null,
+                user_phone,
+                user_company,
+                user_ip,
+                agent_type,
+                category_id,
+                user_message,
+                ai_response,
+                faq_ids_used,
                 confidence,
-                0, // resolved
-                null, // user_satisfaction
-                0, // escalated_to_human
-                null, // escalation_reason
-                null, // created_ticket_id
-                null, // created_lead_id
-                null, // created_inquiry_id
-                null, // created_task_id
-                responseTimeMs,
-                n8nData.tokens_used || null
-            ];
+                resolved,
+                user_satisfaction,
+                escalated_to_human,
+                escalation_reason,
+                created_ticket_id,
+                created_lead_id,
+                created_inquiry_id,
+                created_task_id,
+                response_time_ms,
+                tokens_used,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        `;
 
-            await db.promise().query(insertSql, insertValues);
-            console.log(`✅ Conversation saved to database`);
-            
-        } catch (dbErr) {
-            console.error("❌ Failed to save conversation to database:", dbErr.message);
-            // Don't fail the whole request just because DB save failed
-        }
+        const insertValues = [
+            conversation_id || `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            systemTypeId || context?.system_type_id || null,
+            null, // customer_id
+            null, // lead_id
+            user_email || null,
+            user_name,
+            null, // user_phone
+            null, // user_company
+            req.ip || null,
+            finalAgentType,
+            categoryId,
+            message,
+            n8nData.reply || n8nData.message || "No response",
+            faqIdsUsed.length > 0 ? JSON.stringify(faqIdsUsed) : null,
+            confidence,
+            0, // resolved
+            null, // user_satisfaction
+            0, // escalated_to_human
+            null, // escalation_reason
+            null, // created_ticket_id
+            null, // created_lead_id
+            null, // created_inquiry_id
+            null, // created_task_id
+            responseTimeMs,
+            n8nData.tokens_used || null
+        ];
+
+        db.query(insertSql, insertValues, (err, result) => {
+            if (err) {
+                console.error("❌ Failed to save conversation:", err);
+            } else {
+                console.log(`✅ Conversation saved with ID: ${result.insertId}`);
+            }
+        });
 
         // ===============================
         // RETURN TO CLIENT
@@ -923,7 +688,7 @@ app.post("/ai/chat", async (req, res) => {
             faq_sources: relevantFaqs.length,
             faq_ids: faqIdsUsed,
             response_time_ms: responseTimeMs,
-            source: n8nData.source || "n8n_with_faq",
+            source: "n8n_with_faq",
             timestamp: new Date().toISOString(),
             saved_to_db: true
         };
@@ -938,129 +703,40 @@ app.post("/ai/chat", async (req, res) => {
             }));
         }
 
-        // Add debug info if N8N failed
-        if (n8nError) {
-            clientResponse.debug = {
-                n8n_error: n8nError,
-                used_fallback: true,
-                fallback_reason: "N8N returned invalid response"
-            };
-        }
-
-        console.log(`✅ AI Response ready (${responseTimeMs}ms):`, JSON.stringify({
-            agent_type: finalAgentType,
-            confidence: confidence,
-            response_length: clientResponse.reply?.length || 0,
-            source: clientResponse.source
-        }, null, 2));
-
         return res.json(clientResponse);
 
     } catch (err) {
         console.error("❌ /ai/chat ERROR:", err);
-        console.error("❌ Error stack:", err.stack);
         
-        const responseTimeMs = Date.now() - startTime;
+        // Error logging
+        const errorInsertSql = `
+            INSERT INTO chatbot_conversations
+            (session_id, agent_type, user_message, ai_response, escalated_to_human, error_message, created_at)
+            VALUES (?, ?, ?, ?, 1, ?, NOW())
+        `;
         
-        // Return immediate fallback response
-        const emergencyResponse = {
-            success: true,
-            reply: `I understand you're asking about "${req.body.message || 'pricing'}". ` +
-                   `Our ${req.body.context?.product || 'WasteVantage'} pricing starts from $299/month. ` +
-                   `Would you like me to provide more details or connect you with our sales team?`,
-            agent_type: finalAgentType,
-            confidence: 0.5,
-            response_time_ms: responseTimeMs,
-            source: "emergency_fallback",
+        db.query(errorInsertSql, [
+            `error_${Date.now()}`,
+            req.body.agent_type || "general",
+            req.body.message || "",
+            `Error: ${err.message}`,
+            err.toString()
+        ]);
+
+        return res.status(500).json({
+            success: false,
+            reply: "Our AI service is temporarily unavailable. Please try again.",
+            agent_type: req.body.agent_type || "general",
+            source: "error_fallback",
             timestamp: new Date().toISOString(),
-            error_handled: true
-        };
-        
-        // Try to log error to database (but don't fail if it doesn't work)
-        try {
-            const errorInsertSql = `
-                INSERT INTO chatbot_conversations
-                (session_id, agent_type, user_message, ai_response, escalated_to_human, error_message, created_at)
-                VALUES (?, ?, ?, ?, 1, ?, NOW())
-            `;
-            
-            db.query(errorInsertSql, [
-                `error_${Date.now()}`,
-                req.body.agent_type || "general",
-                req.body.message || "",
-                `Error: ${err.message}`,
-                err.toString()
-            ], () => {
-                // Ignore callback error
-            });
-        } catch (dbErr) {
-            console.error("❌ Also failed to save error to DB:", dbErr.message);
-        }
-        
-        return res.status(200).json(emergencyResponse); // Return 200 with fallback, not 500
+            error: err.message
+        });
     }
 });
 
-// Helper function for extracting search terms
-function extractSearchTerms(message) {
-    const stopWords = ['i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 
-                      'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 
-                      'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 
-                      'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 
-                      'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 
-                      'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 
-                      'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 
-                      'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 
-                      'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 
-                      'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 
-                      'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 
-                      'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'please', 'help'];
-    
-    return message.toLowerCase()
-        .split(/[\s,.?!]+/)
-        .map(term => term.trim())
-        .filter(term => term.length > 2 && !stopWords.includes(term))
-        .map(term => {
-            // Basic stemming
-            return term
-                .replace(/ed$/, '')    // remove 'ed' suffix
-                .replace(/ing$/, '')   // remove 'ing' suffix
-                .replace(/s$/, '');    // remove 's' suffix
-        })
-        .filter(term => term.length > 2)
-        .slice(0, 5); // Limit to 5 most important terms
-}
 
-app.post("/test-ai-fallback", async (req, res) => {
-    const testPayload = {
-        agent_type: "sales",
-        message: "what are your pricing plans?",
-        context: {
-            product: "wastevantage",
-            user_name: "Test User"
-        },
-        conversation_id: "test_" + Date.now()
-    };
-    
-    console.log("🧪 Testing AI endpoint with fallback...");
-    
-    // Simulate the endpoint logic
-    const response = {
-        success: true,
-        reply: `Test response: Our WasteVantage pricing starts from $99/month.`,
-        agent_type: "sales",
-        confidence: 0.85,
-        source: "test_fallback",
-        timestamp: new Date().toISOString()
-    };
-    
-    res.json(response);
-});
 // Helper: Build enhanced prompt
 function buildEnhancedPrompt(promptData, similarConversations, context) {
-    // Ambil agent_type dari promptData atau default ke "general"
-    const agentType = promptData.agent_type || "general";
-    
     let prompt = `
 IDENTITY: ${promptData.identity || 'AI Assistant'}
 ROLE: ${promptData.role_description || ''}
@@ -1109,10 +785,49 @@ ${conv.user_satisfaction ? `User Feedback: ${conv.user_satisfaction}` : ''}
         prompt += `\n\nESCALATION TRIGGERS:\n${promptData.escalation_triggers}`;
     }
     
-    // KOREKSI: Tambahkan parameter agentType (ke-3)
-    return buildSystemPromptForN8N(promptData, context, agentType);
+    return buildSystemPromptForN8N(promptData, context);
 }
 
+// Helper: Build OpenAI messages
+function buildOpenAIMessages(systemPrompt, userMessage, history, context) {
+    const messages = [
+        { role: "system", content: systemPrompt }
+    ];
+
+    // Add context as user message
+    if (Object.keys(context).length > 0) {
+        messages.push({
+            role: "user",
+            content: `Additional context: ${JSON.stringify(context, null, 2)}`
+        });
+    }
+
+    // Add history
+    history.forEach(msg => {
+        messages.push({
+            role: msg.role === 'user' ? 'user' : 'assistant',
+            content: msg.content
+        });
+    });
+
+    // Add current message
+    messages.push({ role: "user", content: userMessage });
+
+    return messages;
+}
+
+app.get("/n8n/test", (req, res) => {
+    res.json({
+        status: "online",
+        message: "Server is running on port 3000",
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            getPrompt: "POST /n8n/get-prompt",
+            aiChat: "POST /ai/chat",
+            liveChat: "Various endpoints"
+        }
+    });
+});
 
 // Test endpoint untuk prompt database
 app.get("/n8n/test-prompt/:agent_type", async (req, res) => {
@@ -1288,274 +1003,95 @@ app.get("/ai/analytics/:agent_type", (req, res) => {
     });
 });
 
+const sanitizeAgentType = (v) =>
+  typeof v === "string"
+    ? v.replace(/^=+/, "").trim().toLowerCase()
+    : "general";
+// Endpoint untuk N8N mengambil prompt dari database
 app.post("/n8n/get-prompt", async (req, res) => {
-  console.log("🔧 N8N Request: Get prompt");
-  
-  // Debug raw body
-  let rawBody = '';
-  req.on('data', chunk => {
-    rawBody += chunk.toString();
-  });
-  
-  req.on('end', async () => {
-    console.log("📦 Raw request body length:", rawBody.length);
-    console.log("📦 Raw request body content:", rawBody);
-    
-    try {
-      let body = {};
-      
-      // Try to parse JSON
-      if (rawBody.trim()) {
-        try {
-          body = JSON.parse(rawBody);
-          console.log("✅ Successfully parsed JSON body");
-        } catch (parseError) {
-          console.log("⚠️ Could not parse as JSON, trying form data...");
-          // Try to parse as form data
-          try {
-            const parsed = new URLSearchParams(rawBody);
-            body = Object.fromEntries(parsed);
-            console.log("📋 Parsed as form data");
-            
-            // Try to parse context JSON if it's a string
-            if (body.context && typeof body.context === 'string') {
-              try {
-                body.context = JSON.parse(body.context);
-              } catch (e) {
-                console.log("⚠️ Could not parse context as JSON");
-              }
-            }
-          } catch (formError) {
-            console.log("❌ Could not parse as form data either:", formError.message);
-          }
-        }
-      } else {
-        console.log("⚠️ Empty raw body received");
-      }
-      
-      console.log("🔍 Processed body:", JSON.stringify(body, null, 2));
-      
-      // Now use `body` instead of `req.body`
-      const rawAgentType = body.agent_type;
-      const context = body.context || {};
-      const message = body.message || "";
-      
-      console.log("🔍 ========== DEBUG START ==========");
-      console.log("🔍 Raw agent_type from request:", rawAgentType);
-      console.log("🔍 Type of agent_type:", typeof rawAgentType);
-      console.log("🔍 Context:", JSON.stringify(context, null, 2));
-      console.log("🔍 Message:", message);
-      
-      // 🔒 FIX: Proper agent_type determination
-      let agentTypeForQuery = "general"; // Default fallback
-      
-      if (rawAgentType) {
-        if (typeof rawAgentType === "string") {
-          const cleanAgentType = rawAgentType.toLowerCase().trim();
-          const allowedTypes = ["sales", "support", "automation", "general"];
-          
-          console.log("🔍 Cleaned agent_type:", cleanAgentType);
-          console.log("🔍 Is in allowed list?", allowedTypes.includes(cleanAgentType));
-          
-          if (allowedTypes.includes(cleanAgentType)) {
-            agentTypeForQuery = cleanAgentType;
-            console.log("✅ Using valid agent_type:", agentTypeForQuery);
-          } else {
-            console.log("⚠️ Invalid agent_type in list, defaulting to general");
-          }
-        } else {
-          console.log("⚠️ Agent_type is not a string, defaulting to general");
-        }
-      } else {
-        console.log("⚠️ No agent_type provided, defaulting to general");
-      }
-      
-      console.log("🔍 Final agent_type for query:", agentTypeForQuery);
-      console.log("🔍 ========== DEBUG END ==========");
+  console.log("🔧 N8N Request: Get prompt for", req.body.agent_type);
 
-      const query = `
-        SELECT * FROM chatbot_prompts
-        WHERE agent_type = ?
-        AND is_active = 1
-        AND status = 'active'
-        ORDER BY version DESC
-        LIMIT 1
-      `;
+  try {
+    const rawAgentType = req.body.agent_type;
+    const agent_type = sanitizeAgentType(rawAgentType);
+    const context = req.body.context || {};
 
-      console.log(`📡 Query Database with: "${agentTypeForQuery}"`);
-      console.log("🔍 SQL Query:", query);
+    console.log("🧹 Sanitized agent_type:", rawAgentType, "→", agent_type);
 
-      db.query(query, [agentTypeForQuery], (error, results) => {
-        if (error) {
-          console.error("❌ Database error:", error);
-          return res.json({
-            success: false,
-            error: "Database query failed",
-            timestamp: new Date().toISOString()
-          });
-        }
-
-        // 🔍 DEBUG: Query results
-        console.log(`🔍 Database results: ${results.length} rows`);
-        if (results.length > 0) {
-          console.log(`🔍 Found record with agent_type: "${results[0].agent_type}"`);
-          console.log(`🔍 Record identity: "${results[0].identity}"`);
-          console.log(`🔍 Record version: "${results[0].version}"`);
-          console.log(`🔍 Record status: "${results[0].status}"`);
-          console.log(`🔍 Record is_active: ${results[0].is_active}`);
-        } else {
-          console.log(`❌ No active prompt found for "${agentTypeForQuery}"`);
-          
-          // Try fallback to general if specific type not found
-          if (agentTypeForQuery !== "general") {
-            console.log(`🔄 Trying fallback to general...`);
-            db.query(query, ["general"], (fallbackError, fallbackResults) => {
-              handleFallbackQuery(fallbackError, fallbackResults, rawAgentType, agentTypeForQuery, context, res);
-            });
-            return;
-          }
-        }
-        
-        handleQueryResults(error, results, rawAgentType, agentTypeForQuery, context, res);
-      });
-
-    } catch (error) {
-      console.error("❌ N8N get-prompt error:", error);
-      res.status(500).json({
+    if (!agent_type) {
+      return res.json({
         success: false,
-        error: error.message,
+        error: "agent_type is required"
+      });
+    }
+
+    const query = `
+      SELECT * FROM chatbot_prompts
+      WHERE agent_type = ?
+      AND is_active = 1
+      ORDER BY status = 'active' DESC, version DESC
+      LIMIT 1
+    `;
+
+    console.log(`📊 SQL Query param: ${agent_type}`);
+
+    db.query(query, [agent_type], (error, results) => {
+      if (error) {
+        console.error("❌ Database error:", error);
+        return res.json({
+          success: false,
+          error: "Database query failed"
+        });
+      }
+
+      if (results.length === 0) {
+        console.log(`❌ No prompt found for ${agent_type}, using fallback`);
+
+        return res.json({
+          success: true,
+          prompt: {
+            system_prompt: `You are a ${agent_type} assistant for iHub products.`,
+            identity: `${agent_type} Assistant`,
+            agent_type: agent_type,
+            language: "australian_english",
+            tone: "professional",
+            version: "fallback_1.0"
+          },
+          is_fallback: true,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      const prompt = results[0];
+
+      const systemPrompt = buildSystemPromptForN8N(prompt, context);
+
+      res.json({
+        success: true,
+        prompt: {
+          system_prompt: systemPrompt,
+          identity: prompt.identity,
+          agent_type: prompt.agent_type,
+          language: prompt.language,
+          tone: prompt.tone,
+          version: prompt.version,
+          context_knowledge: prompt.context_knowledge,
+          status: prompt.status
+        },
+        is_fallback: false,
         timestamp: new Date().toISOString()
       });
-    }
-  });
+    });
+
+  } catch (error) {
+    console.error("❌ N8N get-prompt error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
-// 🔧 Helper function to handle query results
-function handleQueryResults(error, results, rawAgentType, queryAgentType, context, res) {
-  if (error) {
-    console.error("❌ Query error:", error);
-    return sendFallbackResponse(rawAgentType, context, res, "query_error");
-  }
-
-  if (results.length === 0) {
-    console.log(`❌ No prompt found for "${queryAgentType}", using fallback`);
-    return sendFallbackResponse(rawAgentType, context, res, "no_results");
-  }
-
-  const prompt = results[0];
-  console.log(`✅ Found prompt for "${queryAgentType}": ${prompt.identity}`);
-  
-  // 🔒 CRITICAL: Use REQUESTED agent_type, not database agent_type
-  const responseAgentType = rawAgentType || queryAgentType || "general";
-  console.log(`🔍 Response agent_type: "${responseAgentType}"`);
-  
-  // Build system prompt - FORCE correct agent_type
-  const systemPrompt = buildSystemPromptForN8N(prompt, context, responseAgentType);
-
-  res.json({
-    success: true,
-    prompt: {
-      system_prompt: systemPrompt,
-      identity: prompt.identity,
-      agent_type: responseAgentType, // 🔥 USE REQUESTED TYPE
-      language: prompt.language || "australian_english",
-      tone: prompt.tone || "professional",
-      version: prompt.version || "v1.0",
-      context_knowledge: prompt.context_knowledge || "",
-      role_description: prompt.role_description || "",
-      status: prompt.status || "active"
-    },
-    is_fallback: false,
-    timestamp: new Date().toISOString(),
-    debug: {
-      requested_agent_type: rawAgentType,
-      query_agent_type: queryAgentType,
-      db_agent_type: prompt.agent_type,
-      response_agent_type: responseAgentType,
-      note: "Using requested agent_type for response"
-    }
-  });
-}
-
-// 🔧 Helper function for fallback queries
-function handleFallbackQuery(error, results, rawAgentType, originalQueryAgentType, context, res) {
-  if (error) {
-    console.error("❌ Fallback query error:", error);
-    return sendFallbackResponse(rawAgentType, context, res, "fallback_error");
-  }
-
-  if (results.length === 0) {
-    console.log("❌ No general prompt found either, using basic fallback");
-    return sendFallbackResponse(rawAgentType, context, res, "no_general_fallback");
-  }
-
-  const prompt = results[0];
-  console.log(`🔄 Using general fallback prompt`);
-  
-  // Still use requested agent_type even with fallback prompt
-  const responseAgentType = rawAgentType || "general";
-  const systemPrompt = buildSystemPromptForN8N(prompt, context, responseAgentType);
-
-  res.json({
-    success: true,
-    prompt: {
-      system_prompt: systemPrompt,
-      identity: prompt.identity,
-      agent_type: responseAgentType, // 🔥 STILL USE REQUESTED TYPE
-      language: prompt.language || "australian_english",
-      tone: prompt.tone || "professional",
-      version: prompt.version || "v1.0",
-      context_knowledge: prompt.context_knowledge || "",
-      role_description: prompt.role_description || ""
-    },
-    is_fallback: true,
-    timestamp: new Date().toISOString(),
-    debug: {
-      requested_agent_type: rawAgentType,
-      original_query_agent_type: originalQueryAgentType,
-      fallback_agent_type: "general",
-      response_agent_type: responseAgentType,
-      note: "Used general prompt as fallback"
-    }
-  });
-}
-
-// 🔧 Helper function for fallback responses
-function sendFallbackResponse(requestedAgentType, context, res, reason) {
-  console.log(`🔄 Sending fallback response due to: ${reason}`);
-  
-  const responseAgentType = requestedAgentType || "general";
-  const fallbackPrompt = {
-    identity: `${responseAgentType.charAt(0).toUpperCase() + responseAgentType.slice(1)} Assistant`,
-    context_knowledge: "General information about iHub products and services.",
-    role_description: `Assist with ${responseAgentType} related inquiries.`,
-    language: "australian_english",
-    tone: "professional"
-  };
-  
-  const systemPrompt = buildSystemPromptForN8N(fallbackPrompt, context, responseAgentType);
-
-  res.json({
-    success: true,
-    prompt: {
-      system_prompt: systemPrompt,
-      identity: fallbackPrompt.identity,
-      agent_type: responseAgentType, // 🔥 USE REQUESTED TYPE
-      language: fallbackPrompt.language,
-      tone: fallbackPrompt.tone,
-      version: "fallback_1.0",
-      context_knowledge: fallbackPrompt.context_knowledge,
-      role_description: fallbackPrompt.role_description
-    },
-    is_fallback: true,
-    timestamp: new Date().toISOString(),
-    debug: {
-      requested_agent_type: requestedAgentType,
-      response_agent_type: responseAgentType,
-      fallback_reason: reason
-    }
-  });
-}
 
 app.get("/ai/prompts", (req, res) => {
     const query = `
@@ -1693,80 +1229,50 @@ app.get("/ai/dashboard", (req, res) => {
 });
 
 // Bangun system prompt untuk N8N/Ollama
-// FUNGSI YANG BENAR (tunggal):
-function buildSystemPromptForN8N(promptData, context, agentType) {
-  // Ensure agentType is always set
-  const finalAgentType = agentType || promptData.agent_type || "general";
-  
-  console.log(`🔍 Building prompt for agent_type: "${finalAgentType}"`);
-  console.log(`🔍 promptData.agent_type: "${promptData.agent_type}"`);
-  console.log(`🔍 parameter agentType: "${agentType}"`);
-
-  const roleRules = {
-    sales: `
-- You MAY discuss pricing, plans, and subscriptions
-- You MAY guide users toward purchase decisions
-- Focus on product features and benefits
-- Provide clear pricing information when asked`,
-    
-    support: `
-- Focus on troubleshooting and issue resolution
-- DO NOT discuss pricing or sales topics
-- Provide technical assistance and solutions
-- Escalate billing issues to sales team`,
-    
-    automation: `
-- Explain workflows, integrations, and automations
-- Focus on technical implementation steps
-- DO NOT discuss pricing or sales topics
-- Provide guidance on setup and configuration`,
-    
-    general: `
-- Provide high-level product information
-- DO NOT discuss pricing or technical details
-- Route specific inquiries to appropriate teams
-- Maintain general assistance role`
-  };
-
-  const userInfo = context.user_name ? `User: ${context.user_name}` : "";
-  const productInfo = context.product ? `Product: ${context.product}` : "";
-  
-  const prompt = `
-# IDENTITY
-${promptData.identity || `You are a ${finalAgentType} AI assistant for iHub products.`}
-
-# RESPONSIBILITIES
-${promptData.role_description || `Assist users with ${finalAgentType} related inquiries.`}
+function buildSystemPromptForN8N(promptData, context) {
+    let prompt = `# IDENTITY & ROLE
+You are: ${promptData.identity}
+Role: ${promptData.role_description}
 
 # KNOWLEDGE BASE
-${promptData.context_knowledge || "General information about iHub products and services."}
-
-# CONTEXT
-${userInfo}
-${productInfo}
-${context.chat_history_length ? `Chat History Length: ${context.chat_history_length}` : ""}
-
-# ROLE-SPECIFIC RULES
-${roleRules[finalAgentType] || roleRules.general}
+${promptData.context_knowledge}
 
 # COMMUNICATION STYLE
-Language: ${promptData.language || "australian_english"}
-Tone: ${promptData.tone || "professional"}
+- Language: ${promptData.language}
+- Tone: ${promptData.tone}
+- Response Format: ${promptData.response_format || 'clear and concise'}
 
-# HARD CONSTRAINTS
-1. You MUST act strictly as a ${finalAgentType} agent
-2. You are NOT allowed to switch roles
-3. If a request is outside your role, politely redirect
-4. Always maintain professional and helpful tone
+# PRIMARY GOALS
+${promptData.primary_goals}
 
-# FINAL INSTRUCTION
-Answer the user's question clearly, accurately, and according to your role constraints.
-`.trim();
+# DO'S (MUST FOLLOW)
+${promptData.do_guidelines}
 
-  console.log(`🔍 Built prompt length: ${prompt.length} chars`);
-  console.log(`🔍 Prompt starts with: ${prompt.substring(0, 100)}...`);
-  
-  return prompt;
+# DON'TS (AVOID)
+${promptData.dont_guidelines}`;
+
+    // Tambahkan routing rules jika ada
+    if (promptData.routing_rules) {
+        prompt += `\n\n# ROUTING RULES\n${promptData.routing_rules}`;
+    }
+    
+    // Tambahkan escalation triggers jika ada
+    if (promptData.escalation_triggers) {
+        prompt += `\n\n# ESCALATION TRIGGERS\n${promptData.escalation_triggers}`;
+    }
+    
+    // Tambahkan context
+    if (Object.keys(context).length > 0) {
+        prompt += `\n\n# CURRENT USER CONTEXT\n${JSON.stringify(context, null, 2)}`;
+    }
+    
+    prompt += `\n\n# INSTRUCTIONS
+Respond according to your identity, role, and guidelines above.
+Be helpful, professional, and follow all rules strictly.
+If unsure, ask clarifying questions.
+Always end with a question or suggestion for next steps.`;
+    
+    return prompt;
 }
 
 // Endpoint untuk N8N mengirim chat dengan database prompt
@@ -2224,106 +1730,86 @@ async function saveConversation(conversation_id, role, content) {
 
 
 // Helper function untuk query
-function dbQuery(sql, params = []) {
+function dbQuery(sql, params) {
     return new Promise((resolve, reject) => {
         db.query(sql, params, (error, results) => {
             if (error) {
-                console.error("DB QUERY ERROR:", error.code, error.message);
-                return reject(error);
+                reject(error);
+            } else {
+                resolve(results);
             }
-            resolve(results);
         });
     });
 }
 
 // -----------------------------------------------------
-// CHAT GREETING API (From Database)
+// CHAT GREETING API (From Database) - UPDATED VERSION
 // -----------------------------------------------------
-app.get("/api/chat/greeting", async (req, res) => {
+app.get("/api/chat/greeting", (req, res) => {
+    console.log("🔍 /api/chat/greeting endpoint called");
+
+    // Query yang sesuai dengan struktur database Anda
     const query = `
-        SELECT message_text
-        FROM chatbot_welcome_messages
-        WHERE is_active = 1
-        ORDER BY id DESC
+        SELECT message_text 
+        FROM chatbot_welcome_messages 
+        WHERE is_active = 1 
+        ORDER BY id DESC 
         LIMIT 1
     `;
 
-    try {
-        const results = await dbQuery(query);
+    console.log("📊 Executing query:", query);
 
-        if (!results || results.length === 0) {
+    db.query(query, (error, results) => {
+        if (error) {
+            console.error("❌ Database error in /api/chat/greeting:", error);
+            
+            // Return fallback dengan format yang benar
             return res.json({
                 success: true,
-                data: getDefaultGreeting()
+                fallback: true,
+                data: {
+                    message: "👋 Welcome to iHub! How can I assist you today? Please select an option:\n\n" +
+                            "1️⃣ General Questions\n" +
+                            "2️⃣ WasteVantage Sales\n" + 
+                            "3️⃣ Automation Sales\n" +
+                            "4️⃣ Ihub Product Support"
+                }
             });
         }
+
+        console.log("📋 Query results:", results);
+
+        if (results.length === 0) {
+            console.log("ℹ️ No active greeting found in database");
+            return res.json({
+                success: true,
+                data: {
+                    message: "👋 Welcome to iHub! How can I assist you today? Please select an option:\n\n" +
+                            "1️⃣ General Questions\n" +
+                            "2️⃣ WasteVantage Sales\n" + 
+                            "3️⃣ Automation Sales\n" +
+                            "4️⃣ Ihub Product Support"
+                }
+            });
+        }
+
+        const text = results[0].message_text;
+        
+        console.log("✅ Greeting fetched from database:", text.substring(0, 100) + "...");
 
         return res.json({
             success: true,
             data: {
-                message: results[0].message_text
+                message: text
             }
         });
-
-    } catch (error) {
-        console.error("Database error:", error.code);
-
-        return res.status(500).json({
-            success: false,
-            error: "Database unavailable",
-            data: getDefaultGreeting()
-        });
-    }
+    });
 });
 
 function getDefaultGreeting() {
     return {
         message: "👋 Cannot connect to database. Using default greeting..."
     };
-}
-
-async function safeQuery(
-  sql,
-  params = [],
-  {
-    retries = 2,
-    delayMs = 200
-  } = {}
-) {
-  try {
-    return await dbQuery(sql, params);
-  } catch (err) {
-    const retryableErrors = [
-      "ECONNRESET",
-      "PROTOCOL_CONNECTION_LOST",
-      "ETIMEDOUT",
-      "EPIPE"
-    ];
-
-    const shouldRetry =
-      retryableErrors.includes(err.code) && retries > 0;
-
-    if (!shouldRetry) {
-      console.error("❌ DB Query Failed:", {
-        code: err.code,
-        message: err.message,
-        sql
-      });
-      throw err;
-    }
-
-    console.warn(
-      `⚠️ DB error (${err.code}). Retrying in ${delayMs}ms... (${retries} left)`
-    );
-
-    // Delay (simple backoff)
-    await new Promise(res => setTimeout(res, delayMs));
-
-    return safeQuery(sql, params, {
-      retries: retries - 1,
-      delayMs: delayMs * 2 // exponential backoff
-    });
-  }
 }
 
 // -----------------------------------------------------
@@ -2459,14 +1945,22 @@ app.options("/livechat/stream", (req, res) => {
 
 // Create Session with timeout info
 app.post("/livechat/request", (req, res) => {
-    const { name = "Guest", requestedRole = "support", initialMessages = [] } = req.body;
+    const { 
+        name = "Guest", 
+        email = "",  // <- TAMBAHKAN INI
+        requestedRole = "support", 
+        initialMessages = [] 
+    } = req.body;
+    
     const sessionId = uuid();
 
     const safeName = name && name !== "null" ? name : "Guest";
+    const safeEmail = email || "";
 
     sessions[sessionId] = {
         id: sessionId,
         userName: safeName,
+        userEmail: safeEmail,  // <- SIMPAN EMAIL
         requestedRole: requestedRole.toLowerCase(),
         agentName: null,
         messages: [...initialMessages],
@@ -2477,23 +1971,70 @@ app.post("/livechat/request", (req, res) => {
         warningSent: false
     };
 
-    console.log(`🆕 New session: ${sessionId} for ${safeName} (timeout in 2 minutes)`);
+    console.log(`🆕 New session: ${sessionId} for ${safeName} (${safeEmail || 'no email'}) (timeout in 2 minutes)`);
 
     notifyAdmins({
         type: "new_session",
         sessionId: sessionId,
         userName: safeName,
+        userEmail: safeEmail,  // <- KIRIM EMAIL KE ADMIN
         requestedRole: requestedRole.toLowerCase(),
         timestamp: new Date().toISOString(),
-        timeoutIn: SESSION_CLAIM_TIMEOUT / 1000, // Send timeout in seconds
-        message: `New ${requestedRole} session from ${safeName}`
+        timeoutIn: SESSION_CLAIM_TIMEOUT / 1000,
+        message: `New ${requestedRole} session from ${safeName} (${safeEmail || 'no email'})`  // <- TAMBAHKAN EMAIL DI MESSAGE
     });
 
     res.json({ 
         sessionId,
-        timeout: 120, // 2 minutes in seconds
+        timeout: 120,
         message: "Live agent session created. Waiting for agent assignment..."
     });
+});
+
+// Endpoint untuk menerima rating
+app.post('/livechat/rating', (req, res) => {
+    const { sessionId, rating, ratingType, agentName, userName } = req.body;
+    
+    console.log('⭐ Rating received:', {
+        sessionId,
+        rating,
+        ratingType,
+        agentName,
+        userName,
+        timestamp: new Date().toISOString()
+    });
+    
+    // Simpan ke database atau file log
+    // Untuk sekarang kita log saja
+    fs.appendFileSync('ratings.log', 
+        `${new Date().toISOString()} | Session: ${sessionId} | Rating: ${rating} (${ratingType}) | Agent: ${agentName} | User: ${userName}\n`
+    );
+    
+    res.json({ 
+        success: true, 
+        message: 'Rating saved successfully',
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.get('/livechat/session/:sessionId/agent', (req, res) => {
+    const { sessionId } = req.params;
+    
+    // Cari session di database atau memory
+    const session = sessions.get(sessionId);
+    
+    if (session && session.agentName) {
+        res.json({
+            success: true,
+            agentName: session.agentName,
+            sessionId: sessionId
+        });
+    } else {
+        res.json({
+            success: false,
+            message: 'Agent name not found for this session'
+        });
+    }
 });
 
 // Client SSE Stream with timeout support
@@ -3395,6 +2936,18 @@ app.get("/livechat/session/:sessionId/messages", (req, res) => {
     });
 });
 
+app.get('/admin/sessions', (req, res) => {
+    const activeSessions = Object.values(sessions).map(session => ({
+        id: session.id,
+        userName: session.userName,
+        userEmail: session.userEmail,
+        requestedRole: session.requestedRole,
+        status: session.status,
+        waitingTime: Date.now() - session.createdAt
+    }));
+    
+    res.json(activeSessions);
+});
 
 
 // -----------------------------------------------------
@@ -3412,6 +2965,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
