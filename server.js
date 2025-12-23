@@ -3086,76 +3086,51 @@ app.get("/livechat/history/:sessionId", (req, res) => {
 // CLOSE SESSION (cleanup)
 // -----------------------------------------------------
 app.post('/livechat/close', (req, res) => {
-    const { sessionId, agentName, agentRole, reason } = req.body;
-    
-    console.log(`🔒 Closing session ${sessionId} by agent:`, agentName);
-    
+    const { sessionId } = req.body;
+
     if (!sessions[sessionId]) {
         return res.status(404).json({ error: 'Session not found' });
     }
 
-    // DAPATKAN AGENT NAME DARI BODY ATAU MEMORY
-    const finalAgentName = agentName || sessions[sessionId].agentName || 'Unknown Agent';
-    
-    // 1️⃣ UPDATE TABLE UTAMA dengan agent_name, ended_at, dan status
+    // update main table
     db.query(
         `UPDATE chatbot_conversations_liveagent
-         SET agent_name = ?,
-             ended_at = NOW(),
+         SET ended_at = NOW(),
              status = 'ended'
          WHERE session_id = ?`,
-        [finalAgentName, sessionId],
+        [sessionId],
         (err) => {
             if (err) {
                 console.error('❌ DB close error:', err.message);
-                return res.status(500).json({ error: 'Database update failed' });
             }
-            
-            console.log(`✅ Session ${sessionId} closed in database by ${finalAgentName}`);
-            
-            // 2️⃣ LOG KE SESSION LOGS
-            db.query(
-                `INSERT INTO chatbot_session_logs
-                 (session_id, action, details, timestamp)
-                 VALUES (?, 'close', ?, NOW())`,
-                [sessionId, `Session closed by ${finalAgentName}: ${reason || 'Manual close'}`],
-                () => {
-                    // 3️⃣ NOTIFY CLIENT (SSE)
-                    if (clientConnections[sessionId]) {
-                        clientConnections[sessionId].forEach(clientRes => {
-                            try {
-                                const closeEvent = {
-                                    type: 'session_closed',
-                                    agentName: finalAgentName,
-                                    message: `Chat ended by ${finalAgentName}`,
-                                    timestamp: new Date().toISOString()
-                                };
-                                console.log(`📤 Sending close event to client:`, closeEvent);
-                                clientRes.write(`data: ${JSON.stringify(closeEvent)}\n\n`);
-                            } catch (error) {
-                                console.log('❌ Failed to notify client about session close');
-                            }
-                        });
-                    }
-                    
-                    // 4️⃣ CLEANUP MEMORY
-                    if (sessions[sessionId]) {
-                        delete sessions[sessionId];
-                    }
-                    if (clientConnections[sessionId]) {
-                        delete clientConnections[sessionId];
-                    }
-                    
-                    // 5️⃣ RESPONSE
-                    res.json({ 
-                        success: true,
-                        message: 'Session closed successfully',
-                        agentName: finalAgentName
-                    });
-                }
-            );
         }
     );
+
+    // log
+    db.query(
+        `INSERT INTO chatbot_session_logs
+         (session_id, action, details, timestamp)
+         VALUES (?, 'close', 'Session closed by agent', NOW())`,
+        [sessionId],
+        () => {}
+    );
+
+    // notify client
+    if (clientConnections[sessionId]) {
+        clientConnections[sessionId].forEach(res => {
+            try {
+                res.write(`data: ${JSON.stringify({
+                    type: 'session_closed',
+                    timestamp: new Date().toISOString()
+                })}\n\n`);
+            } catch {}
+        });
+    }
+
+    delete sessions[sessionId];
+    delete clientConnections[sessionId];
+
+    res.json({ success: true });
 });
 
 
@@ -3610,6 +3585,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
