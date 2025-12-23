@@ -2447,7 +2447,15 @@ app.post("/livechat/request", (req, res) => {
 
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
-    const { sessionId, rating, ratingType } = req.body;
+    let { sessionId, rating, ratingType } = req.body;
+
+    // ===============================
+    // SAFETY NORMALIZATION
+    // ===============================
+    const VALID = ['Good', 'Needs Improvement', 'Not Rated'];
+
+    if (!VALID.includes(rating)) rating = 'Not Rated';
+    if (!VALID.includes(ratingType)) ratingType = 'Not Rated';
 
     db.query(
         `UPDATE chatbot_conversations_liveagent
@@ -2465,7 +2473,7 @@ app.post('/livechat/rating', (req, res) => {
                 `INSERT INTO chatbot_session_logs
                  (session_id, action, details, timestamp)
                  VALUES (?, 'rating', ?, NOW())`,
-                [sessionId, rating || 'Not Rated'],
+                [sessionId, rating],
                 () => {}
             );
 
@@ -2473,7 +2481,6 @@ app.post('/livechat/rating', (req, res) => {
         }
     );
 });
-
 
 
 
@@ -3530,6 +3537,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
