@@ -2447,56 +2447,145 @@ app.post("/livechat/request", (req, res) => {
 
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
-    const { sessionId, ratingType } = req.body;
-
-    let rating = null;
-
-    // 🔥 TERIMA FORMAT DARI chat.js
-    if (ratingType === 'positive') rating = 'Good';
-    if (ratingType === 'negative') rating = 'Needs Improvement';
-
-    db.query(
-        `UPDATE chatbot_conversations_liveagent
-         SET rating = ?,
-             rating_type = ?
-         WHERE session_id = ?`,
-        [rating, ratingType, sessionId],
-        (err, result) => {
-            if (err) {
-                console.error('❌ DB rating error:', err.message);
-                return res.status(500).json({ success: false });
-            }
-
-            // log session
-            db.query(
-                `INSERT INTO chatbot_session_logs
-                 (session_id, action, details, timestamp)
-                 VALUES (?, 'rating', ?, NOW())`,
-                [sessionId, rating || 'Not Rated'],
-                () => {}
-            );
-
-            res.json({ success: true });
+    const { sessionId, ratingType, rating, agentName, userName, timestamp } = req.body;
+    
+    console.log(`📊 Received rating for session ${sessionId}:`, {
+        ratingType,
+        rating,
+        agentName,
+        userName
+    });
+    
+    try {
+        // VALIDASI INPUT
+        if (!sessionId) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Session ID is required' 
+            });
         }
-    );
+        
+        // TENTUKAN RATING BERDASARKAN ratingType
+        let ratingValue = rating || null; // Ambil dari request body
+        let ratingTypeValue = 'Not Rated';
+        
+        if (ratingType === 'positive' || rating === 'thumbs_up') {
+            ratingTypeValue = 'Good';
+            ratingValue = ratingValue || '👍 Good';
+        } else if (ratingType === 'negative' || rating === 'thumbs_down') {
+            ratingTypeValue = 'Needs Improvement';
+            ratingValue = ratingValue || '👎 Needs Improvement';
+        }
+        
+        console.log(`📊 Saving rating to DB:`, {
+            sessionId,
+            ratingValue,
+            ratingTypeValue
+        });
+        
+        // UPDATE DATABASE dengan rating dan rating_type
+        db.query(
+            `UPDATE chatbot_conversations_liveagent
+             SET rating = ?,
+                 rating_type = ?
+             WHERE session_id = ?`,
+            [ratingValue, ratingTypeValue, sessionId],
+            (err, result) => {
+                if (err) {
+                    console.error('❌ DB rating error:', err.message);
+                    return res.status(500).json({ 
+                        success: false,
+                        error: 'Database update failed' 
+                    });
+                }
+                
+                console.log(`✅ Rating saved for session ${sessionId}: ${ratingTypeValue}`);
+                
+                // LOG KE SESSION LOGS
+                db.query(
+                    `INSERT INTO chatbot_session_logs
+                     (session_id, action, details, timestamp)
+                     VALUES (?, 'rating', ?, NOW())`,
+                    [sessionId, `${ratingTypeValue}: ${ratingValue || ''}`],
+                    (logErr) => {
+                        if (logErr) {
+                            console.error('❌ Log error:', logErr.message);
+                        }
+                    }
+                );
+                
+                res.json({ 
+                    success: true,
+                    message: 'Rating saved successfully' 
+                });
+            }
+        );
+        
+    } catch (error) {
+        console.error('❌ Rating endpoint error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
+        });
+    }
 });
+
+
 
 app.get('/livechat/session/:sessionId/agent', (req, res) => {
     const { sessionId } = req.params;
     
-    // Cari session di database atau memory
-    const session = sessions.get(sessionId);
+    console.log(`🔍 Getting agent name for session: ${sessionId}`);
     
-    if (session && session.agentName) {
-        res.json({
-            success: true,
-            agentName: session.agentName,
-            sessionId: sessionId
-        });
-    } else {
-        res.json({
-            success: false,
-            message: 'Agent name not found for this session'
+    try {
+        // CEK DARI MEMORY TERLEBIH DAHULU
+        if (sessions[sessionId] && sessions[sessionId].agentName) {
+            console.log(`✅ Found agent in memory: ${sessions[sessionId].agentName}`);
+            return res.json({
+                success: true,
+                agentName: sessions[sessionId].agentName,
+                sessionId: sessionId
+            });
+        }
+        
+        // JIKA TIDAK ADA DI MEMORY, CEK DATABASE
+        console.log(`🔍 Agent not found in memory, checking database...`);
+        db.query(
+            `SELECT agent_name FROM chatbot_conversations_liveagent 
+             WHERE session_id = ?`,
+            [sessionId],
+            (err, results) => {
+                if (err) {
+                    console.error('❌ Database error:', err.message);
+                    return res.status(500).json({ 
+                        success: false, 
+                        error: 'Database error' 
+                    });
+                }
+                
+                if (results.length > 0 && results[0].agent_name) {
+                    console.log(`✅ Found agent in database: ${results[0].agent_name}`);
+                    return res.json({
+                        success: true,
+                        agentName: results[0].agent_name,
+                        sessionId: sessionId
+                    });
+                }
+                
+                // JIKA TIDAK DITEMUKAN
+                console.log(`❌ Agent name not found for session: ${sessionId}`);
+                res.json({
+                    success: false,
+                    message: 'Agent name not found for this session'
+                });
+            }
+        );
+        
+    } catch (error) {
+        console.error('❌ Error in getAgentNameFromServer:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error' 
         });
     }
 });
@@ -2997,52 +3086,79 @@ app.get("/livechat/history/:sessionId", (req, res) => {
 // CLOSE SESSION (cleanup)
 // -----------------------------------------------------
 app.post('/livechat/close', (req, res) => {
-    const { sessionId } = req.body;
-
+    const { sessionId, agentName, agentRole, reason } = req.body;
+    
+    console.log(`🔒 Closing session ${sessionId} by agent:`, agentName);
+    
     if (!sessions[sessionId]) {
         return res.status(404).json({ error: 'Session not found' });
     }
 
-    // update main table
+    // DAPATKAN AGENT NAME DARI BODY ATAU MEMORY
+    const finalAgentName = agentName || sessions[sessionId].agentName || 'Unknown Agent';
+    
+    // 1️⃣ UPDATE TABLE UTAMA dengan agent_name, ended_at, dan status
     db.query(
         `UPDATE chatbot_conversations_liveagent
-         SET ended_at = NOW(),
+         SET agent_name = ?,
+             ended_at = NOW(),
              status = 'ended'
          WHERE session_id = ?`,
-        [sessionId],
+        [finalAgentName, sessionId],
         (err) => {
             if (err) {
                 console.error('❌ DB close error:', err.message);
+                return res.status(500).json({ error: 'Database update failed' });
             }
+            
+            console.log(`✅ Session ${sessionId} closed in database by ${finalAgentName}`);
+            
+            // 2️⃣ LOG KE SESSION LOGS
+            db.query(
+                `INSERT INTO chatbot_session_logs
+                 (session_id, action, details, timestamp)
+                 VALUES (?, 'close', ?, NOW())`,
+                [sessionId, `Session closed by ${finalAgentName}: ${reason || 'Manual close'}`],
+                () => {
+                    // 3️⃣ NOTIFY CLIENT (SSE)
+                    if (clientConnections[sessionId]) {
+                        clientConnections[sessionId].forEach(clientRes => {
+                            try {
+                                const closeEvent = {
+                                    type: 'session_closed',
+                                    agentName: finalAgentName,
+                                    message: `Chat ended by ${finalAgentName}`,
+                                    timestamp: new Date().toISOString()
+                                };
+                                console.log(`📤 Sending close event to client:`, closeEvent);
+                                clientRes.write(`data: ${JSON.stringify(closeEvent)}\n\n`);
+                            } catch (error) {
+                                console.log('❌ Failed to notify client about session close');
+                            }
+                        });
+                    }
+                    
+                    // 4️⃣ CLEANUP MEMORY
+                    if (sessions[sessionId]) {
+                        delete sessions[sessionId];
+                    }
+                    if (clientConnections[sessionId]) {
+                        delete clientConnections[sessionId];
+                    }
+                    
+                    // 5️⃣ RESPONSE
+                    res.json({ 
+                        success: true,
+                        message: 'Session closed successfully',
+                        agentName: finalAgentName
+                    });
+                }
+            );
         }
     );
-
-    // log
-    db.query(
-        `INSERT INTO chatbot_session_logs
-         (session_id, action, details, timestamp)
-         VALUES (?, 'close', 'Session closed by agent', NOW())`,
-        [sessionId],
-        () => {}
-    );
-
-    // notify client
-    if (clientConnections[sessionId]) {
-        clientConnections[sessionId].forEach(res => {
-            try {
-                res.write(`data: ${JSON.stringify({
-                    type: 'session_closed',
-                    timestamp: new Date().toISOString()
-                })}\n\n`);
-            } catch {}
-        });
-    }
-
-    delete sessions[sessionId];
-    delete clientConnections[sessionId];
-
-    res.json({ success: true });
 });
+
+
 // -----------------------------------------------------
 // END SESSION (Admin ends chat)
 // -----------------------------------------------------
@@ -3494,6 +3610,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
