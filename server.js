@@ -2447,38 +2447,102 @@ app.post("/livechat/request", (req, res) => {
 
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
-    const { sessionId, ratingType } = req.body;
-
-    let rating = null;
-
-    // 🔥 TERIMA FORMAT DARI chat.js
-    if (ratingType === 'positive') rating = 'Good';
-    if (ratingType === 'negative') rating = 'Needs Improvement';
-
-    db.query(
-        `UPDATE chatbot_conversations_liveagent
-         SET rating = ?,
-             rating_type = ?
-         WHERE session_id = ?`,
-        [rating, ratingType, sessionId],
-        (err, result) => {
-            if (err) {
-                console.error('❌ DB rating error:', err.message);
-                return res.status(500).json({ success: false });
-            }
-
-            // log session
-            db.query(
-                `INSERT INTO chatbot_session_logs
-                 (session_id, action, details, timestamp)
-                 VALUES (?, 'rating', ?, NOW())`,
-                [sessionId, rating || 'Not Rated'],
-                () => {}
-            );
-
-            res.json({ success: true });
+    try {
+        const { 
+            sessionId, 
+            rating, 
+            ratingType, 
+            agentName, 
+            userName, 
+            userEmail 
+        } = req.body;
+        
+        console.log('⭐ Rating received:', req.body);
+        
+        if (!sessionId) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Session ID is required' 
+            });
         }
-    );
+        
+        // Query sederhana untuk insert/update
+        const query = `
+            INSERT INTO chatbot_conversations_liveagent 
+            (session_id, client_name, client_email, agent_name, rating, rating_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'rated')
+            ON DUPLICATE KEY UPDATE 
+                rating = VALUES(rating),
+                rating_type = VALUES(rating_type),
+                agent_name = VALUES(agent_name),
+                status = 'rated'
+        `;
+        
+        const params = [
+            sessionId,
+            userName || 'Guest',
+            userEmail || 'nobody@mail.com',
+            agentName || 'Agent',
+            rating,
+            ratingType
+        ];
+        
+        console.log('SQL params:', params);
+        
+        db.query(query, params, (error, results) => {
+            if (error) {
+                console.error('❌ Database error:', error);
+                console.error('❌ SQL error code:', error.code);
+                console.error('❌ SQL error message:', error.message);
+                
+                // Coba query alternatif yang lebih simple
+                const simpleQuery = `
+                    INSERT INTO chatbot_conversations_liveagent 
+                    (session_id, client_name, rating, rating_type, agent_name)
+                    VALUES (?, ?, ?, ?, ?)
+                `;
+                
+                db.query(simpleQuery, 
+                    [sessionId, userName || 'Guest', rating, ratingType, agentName || 'Agent'], 
+                    (error2, results2) => {
+                        if (error2) {
+                            console.error('❌ Simple query also failed:', error2);
+                            return res.status(500).json({ 
+                                success: false, 
+                                error: 'Database error',
+                                debug: {
+                                    error1: error.message,
+                                    error2: error2.message
+                                }
+                            });
+                        }
+                        
+                        res.json({ 
+                            success: true, 
+                            message: 'Rating saved with simple query',
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                );
+                
+                return;
+            }
+            
+            res.json({ 
+                success: true, 
+                message: 'Rating saved successfully',
+                timestamp: new Date().toISOString()
+            });
+        });
+        
+    } catch (err) {
+        console.error('❌ Unexpected error in /livechat/rating:', err);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Internal server error',
+            details: err.message
+        });
+    }
 });
 
 app.get('/livechat/session/:sessionId/agent', (req, res) => {
@@ -3492,6 +3556,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
