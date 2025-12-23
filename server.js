@@ -2395,46 +2395,50 @@ app.options("/livechat/stream", (req, res) => {
 
 // Create Session with timeout info
 app.post("/livechat/request", (req, res) => {
-    const { 
-        name = "Guest", 
-        email = "",  // <- TAMBAHKAN INI
-        requestedRole = "support", 
-        initialMessages = [] 
-    } = req.body;
-    
-    const sessionId = uuid();
+    const { name = "Guest", email = "", requestedRole = "support", initialMessages = [] } = req.body;
 
+    const sessionId = uuid();
     const safeName = name && name !== "null" ? name : "Guest";
     const safeEmail = email || "";
 
     sessions[sessionId] = {
         id: sessionId,
         userName: safeName,
-        userEmail: safeEmail,  // <- SIMPAN EMAIL
+        userEmail: safeEmail,
         requestedRole: requestedRole.toLowerCase(),
         agentName: null,
         messages: [...initialMessages],
         createdAt: new Date(),
         lastActivity: new Date(),
         status: 'waiting',
-        timeoutAt: new Date(Date.now() + SESSION_CLAIM_TIMEOUT), // Set timeout 2 minutes from now
+        timeoutAt: new Date(Date.now() + SESSION_CLAIM_TIMEOUT),
         warningSent: false
     };
 
-    console.log(`🆕 New session: ${sessionId} for ${safeName} (${safeEmail || 'no email'}) (timeout in 2 minutes)`);
+    // 🔥 INSERT AWAL (WAJIB)
+    db.query(
+        `INSERT INTO chatbot_conversations_liveagent
+         (session_id, client_name, client_email, conversation_text, created_at, status)
+         VALUES (?, ?, ?, '', NOW(), 'active')`,
+        [sessionId, safeName, safeEmail],
+        (err) => {
+            if (err) {
+                console.error('❌ DB create conversation error:', err.message);
+            }
+        }
+    );
 
     notifyAdmins({
         type: "new_session",
-        sessionId: sessionId,
+        sessionId,
         userName: safeName,
-        userEmail: safeEmail,  // <- KIRIM EMAIL KE ADMIN
+        userEmail: safeEmail,
         requestedRole: requestedRole.toLowerCase(),
         timestamp: new Date().toISOString(),
-        timeoutIn: SESSION_CLAIM_TIMEOUT / 1000,
-        message: `New ${requestedRole} session from ${safeName} (${safeEmail || 'no email'})`  // <- TAMBAHKAN EMAIL DI MESSAGE
+        timeoutIn: SESSION_CLAIM_TIMEOUT / 1000
     });
 
-    res.json({ 
+    res.json({
         sessionId,
         timeout: 120,
         message: "Live agent session created. Waiting for agent assignment..."
@@ -2443,28 +2447,38 @@ app.post("/livechat/request", (req, res) => {
 
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
-    const { sessionId, rating, ratingType, agentName, userName } = req.body;
-    
-    console.log('⭐ Rating received:', {
-        sessionId,
-        rating,
-        ratingType,
-        agentName,
-        userName,
-        timestamp: new Date().toISOString()
-    });
-    
-    // Simpan ke database atau file log
-    // Untuk sekarang kita log saja
-    fs.appendFileSync('ratings.log', 
-        `${new Date().toISOString()} | Session: ${sessionId} | Rating: ${rating} (${ratingType}) | Agent: ${agentName} | User: ${userName}\n`
+    const { sessionId, ratingType } = req.body;
+
+    let rating = null;
+
+    // 🔥 TERIMA FORMAT DARI chat.js
+    if (ratingType === 'positive') rating = 'Good';
+    if (ratingType === 'negative') rating = 'Needs Improvement';
+
+    db.query(
+        `UPDATE chatbot_conversations_liveagent
+         SET rating = ?,
+             rating_type = ?
+         WHERE session_id = ?`,
+        [rating, ratingType, sessionId],
+        (err, result) => {
+            if (err) {
+                console.error('❌ DB rating error:', err.message);
+                return res.status(500).json({ success: false });
+            }
+
+            // log session
+            db.query(
+                `INSERT INTO chatbot_session_logs
+                 (session_id, action, details, timestamp)
+                 VALUES (?, 'rating', ?, NOW())`,
+                [sessionId, rating || 'Not Rated'],
+                () => {}
+            );
+
+            res.json({ success: true });
+        }
     );
-    
-    res.json({ 
-        success: true, 
-        message: 'Rating saved successfully',
-        timestamp: new Date().toISOString()
-    });
 });
 
 app.get('/livechat/session/:sessionId/agent', (req, res) => {
@@ -2640,72 +2654,82 @@ app.get("/livechat/admin/stream", (req, res) => {
 });
 
 // Send Message
-app.post('/livechat/send', async (req, res) => {
+app.post('/livechat/send', (req, res) => {
     try {
         const { sessionId, text, from, name } = req.body;
-        
+
         if (!sessionId || !text) {
             return res.status(400).json({ error: 'Session ID and text are required' });
         }
 
-        console.log(`📨 Message from ${from} in session ${sessionId}: ${text}`);
-
         if (!sessions[sessionId]) {
             return res.status(404).json({ error: 'Session not found' });
         }
-        
-        // Check if session is timed out
-        if (sessions[sessionId].status === 'timed_out') {
-            return res.status(400).json({ 
-                error: 'Session timed out. No agents available within 2 minutes.' 
-            });
-        }
-        
+
+        const senderName =
+            from === 'agent'
+                ? (sessions[sessionId].agentName || 'Agent')
+                : (sessions[sessionId].userName || 'Guest');
+
+        const line =
+            `[${senderName} - ${new Date().toLocaleString()}] ${text}\n`;
+
+        // 1️⃣ APPEND KE conversation_text
+        db.query(
+            `UPDATE chatbot_conversations_liveagent
+             SET conversation_text = CONCAT(IFNULL(conversation_text,''), ?)
+             WHERE session_id = ?`,
+            [line, sessionId],
+            (err) => {
+                if (err) {
+                    console.error('❌ DB append conversation error:', err.message);
+                }
+            }
+        );
+
+        // 2️⃣ LOG KE session_logs
+        db.query(
+            `INSERT INTO chatbot_session_logs
+             (session_id, action, details, timestamp)
+             VALUES (?, 'message', ?, NOW())`,
+            [sessionId, `${senderName}: ${text}`],
+            () => {}
+        );
+
+        // === LOGIC CHAT LAMA (TETAP) ===
         const message = {
-            from: from || 'user',
-            text: text,
+            from,
+            text,
             timestamp: new Date().toISOString(),
-            name: name || (from === 'agent' ? 'Agent' : 'Guest')
+            name: senderName
         };
-        
+
         sessions[sessionId].messages.push(message);
         sessions[sessionId].lastActivity = Date.now();
 
         if (from === 'user') {
-            console.log(`📤 User message → Notifying ${adminClients.length} admins`);
-            
             notifyAdmins({
                 type: "message",
-                sessionId: sessionId,
+                sessionId,
                 from: 'user',
-                text: text,
-                userName: sessions[sessionId].userName,
+                text,
+                userName: senderName,
                 timestamp: new Date().toISOString()
             });
-            
-        } else if (from === 'agent') {
-            console.log(`📤 Admin message → Sending to client session ${sessionId}`);
-            
-            if (clientConnections[sessionId]) {
-                clientConnections[sessionId].forEach((clientRes, index) => {
-                    try {
-                        if (!clientRes.writableEnded && clientRes.writable) {
-                            clientRes.write(`data: ${JSON.stringify(message)}\n\n`);
-                            console.log(`✅ Admin message delivered to client ${index}`);
-                        }
-                    } catch (error) {
-                        console.log(`❌ Failed to send to client ${index}:`, error.message);
-                    }
-                });
-            } else {
-                console.log(`❌ No client connections for session ${sessionId}`);
-            }
         }
 
-        res.json({ success: true, message: 'Message sent' });
+        if (from === 'agent' && clientConnections[sessionId]) {
+            clientConnections[sessionId].forEach(res => {
+                try {
+                    res.write(`data: ${JSON.stringify(message)}\n\n`);
+                } catch {}
+            });
+        }
 
-    } catch (error) {
-        console.error('❌ Error sending message:', error);
+        res.json({ success: true });
+
+    } catch (err) {
+        console.error(err);
         res.status(500).json({ error: 'Failed to send message' });
     }
 });
@@ -2793,23 +2817,57 @@ app.post("/livechat/claim", (req, res) => {
 
     console.log(`Claiming session ${sessionId} by ${agentName} (${agentRole})`);
 
+    // 1️⃣ VALIDASI SESSION
     if (!sessions[sessionId]) {
         return res.status(400).json({ error: "Invalid session" });
     }
-    
-    // Check if session is already timed out
+
+    // 2️⃣ CEK TIMEOUT
     if (sessions[sessionId].status === 'timed_out') {
         return res.status(400).json({ 
             error: "Session has already timed out. Please ask the user to start a new session." 
         });
     }
 
+    // 3️⃣ CEK SUDAH DICLAIM
+    if (sessions[sessionId].agentName) {
+        return res.status(400).json({ 
+            error: "Session already claimed by another agent" 
+        });
+    }
+
+    // 4️⃣ SIMPAN KE MEMORY (WAJIB)
     sessions[sessionId].agentName = agentName;
     sessions[sessionId].assignedRole = agentRole.toLowerCase();
     sessions[sessionId].lastActivity = new Date();
     sessions[sessionId].status = 'claimed';
     sessions[sessionId].claimedAt = new Date().toISOString();
 
+    // 5️⃣ UPDATE TABLE UTAMA (🔥 AUTO SAVE AGENT)
+    db.query(
+        `UPDATE chatbot_conversations_liveagent
+         SET agent_name = ?,
+             status = 'claimed'
+         WHERE session_id = ?
+           AND agent_name IS NULL`,
+        [agentName, sessionId],
+        (err) => {
+            if (err) {
+                console.error('❌ DB claim update error:', err.message);
+            }
+        }
+    );
+
+    // 6️⃣ LOG KE SESSION LOGS
+    db.query(
+        `INSERT INTO chatbot_session_logs
+         (session_id, action, details, timestamp)
+         VALUES (?, 'claim', ?, NOW())`,
+        [sessionId, `Claimed by ${agentName} (${agentRole})`],
+        () => {}
+    );
+
+    // 7️⃣ NOTIFY ADMIN LAIN
     notifyAdmins({
         type: "assigned",
         sessionId,
@@ -2820,7 +2878,7 @@ app.post("/livechat/claim", (req, res) => {
         timestamp: new Date().toISOString()
     });
 
-    // Notify client that agent has claimed the session
+    // 8️⃣ NOTIFY CLIENT (SSE)
     if (clientConnections[sessionId]) {
         clientConnections[sessionId].forEach(clientRes => {
             try {
@@ -2831,21 +2889,22 @@ app.post("/livechat/claim", (req, res) => {
                     timestamp: new Date().toISOString()
                 })}\n\n`);
             } catch (error) {
-                console.log('Failed to notify client about agent connection');
+                console.log('❌ Failed to notify client about agent connection');
             }
         });
     }
 
+    // 9️⃣ WELCOME MESSAGE (TETAP SEPERTI SEKARANG)
     const welcomeMsg = {
         from: "agent",
         text: `Hello, I'm ${agentName} from the ${agentRole} team. How can I help you today?`,
-        time: Date.now(),
         timestamp: new Date().toISOString()
     };
 
     sessions[sessionId].messages.push(welcomeMsg);
     pushToClients(sessionId, welcomeMsg);
 
+    // 🔟 RESPONSE
     res.json({ 
         success: true,
         message: "Session claimed successfully"
@@ -2935,35 +2994,53 @@ app.get("/livechat/history/:sessionId", (req, res) => {
 // -----------------------------------------------------
 // CLOSE SESSION (cleanup)
 // -----------------------------------------------------
-app.post("/livechat/close", (req, res) => {
+app.post('/livechat/close', (req, res) => {
     const { sessionId } = req.body;
 
     if (!sessions[sessionId]) {
-        return res.status(404).json({ error: "Session not found" });
+        return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Notify client if still connected
+    // update main table
+    db.query(
+        `UPDATE chatbot_conversations_liveagent
+         SET ended_at = NOW(),
+             status = 'ended'
+         WHERE session_id = ?`,
+        [sessionId],
+        (err) => {
+            if (err) {
+                console.error('❌ DB close error:', err.message);
+            }
+        }
+    );
+
+    // log
+    db.query(
+        `INSERT INTO chatbot_session_logs
+         (session_id, action, details, timestamp)
+         VALUES (?, 'close', 'Session closed by agent', NOW())`,
+        [sessionId],
+        () => {}
+    );
+
+    // notify client
     if (clientConnections[sessionId]) {
-        clientConnections[sessionId].forEach(clientRes => {
+        clientConnections[sessionId].forEach(res => {
             try {
-                clientRes.write(`data: ${JSON.stringify({
+                res.write(`data: ${JSON.stringify({
                     type: 'session_closed',
-                    message: 'Session has been closed',
                     timestamp: new Date().toISOString()
                 })}\n\n`);
-            } catch (error) {
-                // Ignore errors
-            }
+            } catch {}
         });
     }
 
-    // Clean up
     delete sessions[sessionId];
     delete clientConnections[sessionId];
 
-    res.json({ success: true, message: "Session closed" });
+    res.json({ success: true });
 });
-
 // -----------------------------------------------------
 // END SESSION (Admin ends chat)
 // -----------------------------------------------------
@@ -3415,6 +3492,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
