@@ -2445,6 +2445,31 @@ app.post("/livechat/request", (req, res) => {
     });
 });
 
+app.get('/livechat/session/:sessionId/agent', (req, res) => {
+    const { sessionId } = req.params;
+    
+    console.log(`🔍 Requesting agent name for session: ${sessionId}`);
+    
+    // Cari session di memori
+    if (!sessions[sessionId]) {
+        return res.status(404).json({
+            success: false,
+            message: 'Session not found',
+            agentName: null
+        });
+    }
+    
+    const session = sessions[sessionId];
+    
+    res.json({
+        success: true,
+        agentName: session.agentName || null,
+        sessionId: sessionId,
+        userName: session.userName,
+        status: session.status
+    });
+});
+
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
     try {
@@ -2454,10 +2479,18 @@ app.post('/livechat/rating', (req, res) => {
             ratingType, 
             agentName, 
             userName, 
-            userEmail 
+            userEmail,
+            timestamp
         } = req.body;
         
-        console.log('⭐ Rating received:', req.body);
+        console.log('⭐ Rating received:', {
+            sessionId,
+            rating,
+            ratingType,
+            agentName,
+            userName,
+            timestamp: timestamp || new Date().toISOString()
+        });
         
         if (!sessionId) {
             return res.status(400).json({ 
@@ -2466,71 +2499,92 @@ app.post('/livechat/rating', (req, res) => {
             });
         }
         
-        // Query sederhana untuk insert/update
+        // Cek session di memori untuk mendapatkan data jika ada
+        const session = sessions[sessionId];
+        
+        // Sesuaikan dengan struktur database Anda
+        // rating: VARCHAR(50) - jadi kita simpan sebagai string
+        // rating_type: ENUM('Good', 'Needs Improvement', 'Not Rated')
+        
+        // Map ratingType ke nilai ENUM yang valid
+        let dbRatingType = 'Not Rated';
+        if (ratingType === 'positive' || rating === 'thumbs_up') {
+            dbRatingType = 'Good';
+        } else if (ratingType === 'negative' || rating === 'thumbs_down') {
+            dbRatingType = 'Needs Improvement';
+        }
+        
+        // Map rating value ke string untuk kolom VARCHAR
+        let dbRatingValue = null;
+        if (rating === 'thumbs_up' || ratingType === 'positive') {
+            dbRatingValue = '5';
+        } else if (rating === 'thumbs_down' || ratingType === 'negative') {
+            dbRatingValue = '1';
+        } else if (typeof rating === 'number') {
+            dbRatingValue = rating.toString();
+        } else {
+            dbRatingValue = rating;
+        }
+        
+        // Query untuk insert atau update
         const query = `
             INSERT INTO chatbot_conversations_liveagent 
-            (session_id, client_name, client_email, agent_name, rating, rating_type, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'rated')
+            (session_id, client_name, client_email, agent_name, rating, rating_type, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'ended', NOW())
             ON DUPLICATE KEY UPDATE 
-                rating = VALUES(rating),
-                rating_type = VALUES(rating_type),
-                agent_name = VALUES(agent_name),
-                status = 'rated'
+                agent_name = COALESCE(?, agent_name),
+                rating = COALESCE(?, rating),
+                rating_type = COALESCE(?, rating_type),
+                status = 'ended',
+                ended_at = NOW()
         `;
         
         const params = [
+            // INSERT values
             sessionId,
-            userName || 'Guest',
-            userEmail || 'nobody@mail.com',
-            agentName || 'Agent',
-            rating,
-            ratingType
+            userName || (session ? session.userName : 'Guest'),
+            userEmail || (session ? session.userEmail : 'nobody@mail.com'),
+            agentName || (session ? session.agentName : 'Agent'),
+            dbRatingValue,
+            dbRatingType,
+            // UPDATE values
+            agentName || (session ? session.agentName : 'Agent'),
+            dbRatingValue,
+            dbRatingType
         ];
         
-        console.log('SQL params:', params);
+        console.log('Executing rating query with params:', params);
         
         db.query(query, params, (error, results) => {
             if (error) {
-                console.error('❌ Database error:', error);
-                console.error('❌ SQL error code:', error.code);
-                console.error('❌ SQL error message:', error.message);
+                console.error('❌ Database error saving rating:', error);
+                console.error('Full error details:', error);
                 
-                // Coba query alternatif yang lebih simple
-                const simpleQuery = `
-                    INSERT INTO chatbot_conversations_liveagent 
-                    (session_id, client_name, rating, rating_type, agent_name)
-                    VALUES (?, ?, ?, ?, ?)
-                `;
+                // Fallback: Simpan session ke memori jika database error
+                if (session) {
+                    session.rating = dbRatingValue;
+                    session.ratingType = dbRatingType;
+                    session.ratedAt = new Date().toISOString();
+                    console.log('✅ Rating saved to session memory as backup');
+                }
                 
-                db.query(simpleQuery, 
-                    [sessionId, userName || 'Guest', rating, ratingType, agentName || 'Agent'], 
-                    (error2, results2) => {
-                        if (error2) {
-                            console.error('❌ Simple query also failed:', error2);
-                            return res.status(500).json({ 
-                                success: false, 
-                                error: 'Database error',
-                                debug: {
-                                    error1: error.message,
-                                    error2: error2.message
-                                }
-                            });
-                        }
-                        
-                        res.json({ 
-                            success: true, 
-                            message: 'Rating saved with simple query',
-                            timestamp: new Date().toISOString()
-                        });
-                    }
-                );
-                
-                return;
+                return res.status(200).json({ 
+                    success: true, 
+                    message: 'Rating recorded (database error, saved to memory)',
+                    saved_to_memory: true,
+                    timestamp: new Date().toISOString()
+                });
             }
+            
+            console.log(`✅ Rating saved to database, affected rows: ${results.affectedRows}`);
             
             res.json({ 
                 success: true, 
                 message: 'Rating saved successfully',
+                saved_to_db: true,
+                affected_rows: results.affectedRows,
+                rating_value: dbRatingValue,
+                rating_type: dbRatingType,
                 timestamp: new Date().toISOString()
             });
         });
@@ -2541,26 +2595,6 @@ app.post('/livechat/rating', (req, res) => {
             success: false, 
             error: 'Internal server error',
             details: err.message
-        });
-    }
-});
-
-app.get('/livechat/session/:sessionId/agent', (req, res) => {
-    const { sessionId } = req.params;
-    
-    // Cari session di database atau memory
-    const session = sessions.get(sessionId);
-    
-    if (session && session.agentName) {
-        res.json({
-            success: true,
-            agentName: session.agentName,
-            sessionId: sessionId
-        });
-    } else {
-        res.json({
-            success: false,
-            message: 'Agent name not found for this session'
         });
     }
 });
@@ -3556,6 +3590,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
