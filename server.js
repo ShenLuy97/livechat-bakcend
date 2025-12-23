@@ -2447,88 +2447,33 @@ app.post("/livechat/request", (req, res) => {
 
 // Endpoint untuk menerima rating
 app.post('/livechat/rating', (req, res) => {
-    const { sessionId, ratingType, rating, agentName, userName, timestamp } = req.body;
-    
-    console.log(`📊 Received rating for session ${sessionId}:`, {
-        ratingType,
-        rating,
-        agentName,
-        userName
-    });
-    
-    try {
-        // VALIDASI INPUT
-        if (!sessionId) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Session ID is required' 
-            });
-        }
-        
-        // TENTUKAN RATING BERDASARKAN ratingType
-        let ratingValue = rating || null; // Ambil dari request body
-        let ratingTypeValue = 'Not Rated';
-        
-        if (ratingType === 'positive' || rating === 'thumbs_up') {
-            ratingTypeValue = 'Good';
-            ratingValue = ratingValue || '👍 Good';
-        } else if (ratingType === 'negative' || rating === 'thumbs_down') {
-            ratingTypeValue = 'Needs Improvement';
-            ratingValue = ratingValue || '👎 Needs Improvement';
-        }
-        
-        console.log(`📊 Saving rating to DB:`, {
-            sessionId,
-            ratingValue,
-            ratingTypeValue
-        });
-        
-        // UPDATE DATABASE dengan rating dan rating_type
-        db.query(
-            `UPDATE chatbot_conversations_liveagent
-             SET rating = ?,
-                 rating_type = ?
-             WHERE session_id = ?`,
-            [ratingValue, ratingTypeValue, sessionId],
-            (err, result) => {
-                if (err) {
-                    console.error('❌ DB rating error:', err.message);
-                    return res.status(500).json({ 
-                        success: false,
-                        error: 'Database update failed' 
-                    });
-                }
-                
-                console.log(`✅ Rating saved for session ${sessionId}: ${ratingTypeValue}`);
-                
-                // LOG KE SESSION LOGS
-                db.query(
-                    `INSERT INTO chatbot_session_logs
-                     (session_id, action, details, timestamp)
-                     VALUES (?, 'rating', ?, NOW())`,
-                    [sessionId, `${ratingTypeValue}: ${ratingValue || ''}`],
-                    (logErr) => {
-                        if (logErr) {
-                            console.error('❌ Log error:', logErr.message);
-                        }
-                    }
-                );
-                
-                res.json({ 
-                    success: true,
-                    message: 'Rating saved successfully' 
-                });
+    const { sessionId, rating, ratingType } = req.body;
+
+    db.query(
+        `UPDATE chatbot_conversations_liveagent
+         SET rating = ?,
+             rating_type = ?
+         WHERE session_id = ?`,
+        [rating, ratingType, sessionId],
+        (err) => {
+            if (err) {
+                console.error('❌ DB rating error:', err.message);
+                return res.status(500).json({ success: false });
             }
-        );
-        
-    } catch (error) {
-        console.error('❌ Rating endpoint error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Internal server error' 
-        });
-    }
+
+            db.query(
+                `INSERT INTO chatbot_session_logs
+                 (session_id, action, details, timestamp)
+                 VALUES (?, 'rating', ?, NOW())`,
+                [sessionId, rating || 'Not Rated'],
+                () => {}
+            );
+
+            res.json({ success: true });
+        }
+    );
 });
+
 
 
 
@@ -3585,6 +3530,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
