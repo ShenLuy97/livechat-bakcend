@@ -2,34 +2,59 @@ const express = require("express");
 const mysql = require("mysql2");
 const cors = require("cors");
 const { v4: uuid } = require("uuid");
+const nodemailer = require("nodemailer");
 
 const app = express();
 
-// Manual CORS headers for extra safety
-app.use((req, res, next) => {
-    const allowedOrigins = [
+/* ============================
+   BODY PARSER – WAJIB PALING ATAS
+============================= */
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+app.use(cors({
+    origin: function(origin, callback) {
+        if (!origin) return callback(null, true);
+
+        const allowedOrigins = [
         'https://livechat-bakcend.onrender.com',
         'https://n8n.ihubtechnologies.com.au',
         'https://demo-crm.ihubtechnologies.com.au',
         'https://ihubs-chat.infinityfreeapp.com'
-    ];
-    
-    const origin = req.headers.origin;
-    if (allowedOrigins.includes(origin)) {
-        res.header('Access-Control-Allow-Origin', origin);
-    }
-    
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE, PATCH');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Debug, X-Source');
-    res.header('Access-Control-Expose-Headers', 'Content-Length, Content-Type, X-Response-Time');
-    
-    // Handle preflight requests
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-    
+        ];
+
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.log("❌ CORS blocked:", origin);
+            callback(null, false);   // ⛔ JANGAN throw Error
+        }
+    },
+    credentials: true,
+    methods: ['GET','POST','OPTIONS','PUT','DELETE','PATCH'],
+    allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
+}));
+
+// Manual CORS headers for extra safety
+app.use((req,res,next)=>{
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
+});
+
+// -----------------------------------------------------
+// MYSQL CONNECTION
+// -----------------------------------------------------
+const db = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0
 });
 
 // Specific OPTIONS handler for problematic routes
@@ -49,25 +74,8 @@ app.options('/n8n/get-prompt', (req, res) => {
     res.status(200).end();
 });
 
-app.use(express.json());
 
-// -----------------------------------------------------
-// MYSQL CONNECTION
-// -----------------------------------------------------
-const db = mysql.createPool({
-    host: "demo-ovhv1.ihubtechnologies.com.au",
-    user: "root",
-    password: "hb]D228Jf#Fy",
-    database: "ihub_database",
-    port: 3306,
 
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-
-    enableKeepAlive: true,
-    keepAliveInitialDelay: 0
-});
 
 // -----------------------------------------------------
 // LIVE CHAT IN-MEMORY STORE
@@ -220,6 +228,114 @@ setInterval(() => {
         }
     });
 }, 10000); // Check every 10 seconds
+
+
+console.log('='.repeat(50));
+console.log('🔍 ENVIRONMENT VARIABLES CHECK');
+console.log('='.repeat(50));
+console.log('GMAIL_USER:', process.env.GMAIL_USER);
+console.log('GMAIL_APP_PASSWORD present:', !!process.env.GMAIL_APP_PASSWORD);
+console.log('GMAIL_APP_PASSWORD length:', process.env.GMAIL_APP_PASSWORD ? process.env.GMAIL_APP_PASSWORD.length : 'NULL');
+console.log('='.repeat(50));
+
+// Validasi environment variables
+if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+    console.error('❌ ERROR: Email credentials missing in .env file!');
+    console.error('Make sure .env has:');
+    console.error('GMAIL_USER=your_email@gmail.com');
+    console.error('GMAIL_APP_PASSWORD=your_16_char_app_password');
+    process.exit(1);
+}
+
+
+// Konfigurasi Nodemailer transporter yang TERBUKTI BEKERJA
+const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD
+    }
+});
+
+transporter.verify(err => {
+    if (err) console.log("❌ Gmail error:", err.message);
+    else console.log("✅ Gmail SMTP ready");
+});
+
+
+
+// Endpoint untuk kirim email
+app.post("/api/send-contact-email", (req, res) => {
+    const {
+        first_name,
+        last_name,
+        email,
+        phone,
+        website_url,
+        postcode,
+        system_type_id,
+        inquire_type_id,
+        message
+    } = req.body;
+
+    if (!first_name || !last_name || !email || !message) {
+        return res.status(400).json({ success:false, error:"Missing required fields" });
+    }
+
+    const sql = `
+        INSERT INTO inquiries
+        (first_name,last_name,email,phone,website_url,postcode,message,inquire_type_id,system_type_id,status,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,'new',NOW())
+    `;
+
+    db.query(sql, [
+        first_name,
+        last_name,
+        email,
+        phone,
+        website_url,
+        postcode,
+        message,
+        inquire_type_id,
+        system_type_id
+    ], (err, result) => {
+
+        if (err) {
+            console.error("❌ DB ERROR:", err.sqlMessage || err);
+            return res.status(500).json({ success:false, error:"Database insert failed" });
+        }
+
+        const mail = {
+            from: `"iHub Chat Widget" <${process.env.GMAIL_USER}>`,
+            to: "shenluy@gmail.com",
+            replyTo: email,
+            subject: `📩 Inquiry IHUB CRM - ${first_name} ${last_name}`,
+            text: `
+                    First Name: ${first_name}
+                    Last Name : ${last_name}
+                    Email     : ${email}
+                    Phone     : ${phone}
+                    Website   : ${website_url}
+                    Postcode  : ${postcode}
+                    System    : IHUB CRM
+                    Inquiry   : Website
+
+                    Message:
+                    ${message}
+                    `
+                    };
+
+        transporter.sendMail(mail, (mailErr) => {
+            if (mailErr) {
+                console.error("❌ EMAIL ERROR:", mailErr);
+                return res.status(500).json({ success:false, error:"Email failed" });
+            }
+
+            res.json({ success:true, inquiry_id: result.insertId });
+        });
+    });
+});
+
 
 
 // -----------------------------------------------------
@@ -3537,6 +3653,7 @@ app.listen(PORT, () => {
     console.log(`✅ All endpoints preserved and functional`);
     console.log("=============================");
 });
+
 
 
 
